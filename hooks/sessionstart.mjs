@@ -51,6 +51,70 @@ await runHook(async () => {
   const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
   const { loadSessionDB } = createSessionLoaders(HOOK_DIR);
 
+  // Self-heal a partial plugin cache install before anything else
+  // touches the cache dir. The Algo-D4 boot gate and the #604
+  // normalize-hooks ratchet both fire from start.mjs, which is one of
+  // the files that may be missing in the failure mode; sessionstart.mjs
+  // fires from CC's hooks.json wiring regardless of MCP boot status, so
+  // it is the reliably-available entry point. See
+  // hooks/heal-partial-install.mjs for the full failure-mode description.
+  try {
+    const { healPartialInstallFromMarketplace } = await import("./heal-partial-install.mjs");
+    healPartialInstallFromMarketplace();
+  } catch { /* best effort, never block session start */ }
+
+  // Issue #710 — Layer 2: self-heal Claude Code's per-session shell snapshots.
+  //
+  // Claude Code `source`s ~/.claude/shell-snapshots/snapshot-*.sh before every
+  // Bash tool call (refs/platforms/claude-code/src/utils/bash/ShellSnapshot.ts:269-336,
+  // sourced at bashProvider.ts:166). The snapshot bakes an `export PATH='…'`
+  // line with the context-mode `bin/` of the version active at session boot.
+  // After /ctx-upgrade deletes the old cache dir, the snapshot still points
+  // at it — every Bash call fails with "Plugin directory does not exist"
+  // until the session restarts.
+  //
+  // Layer 1 (cli.ts /ctx-upgrade) rewrites the active session's snapshot
+  // mid-upgrade so the in-process session never sees the broken state.
+  // Layer 2 (this) catches sessions that started after /ctx-upgrade but
+  // whose snapshots somehow missed the rewrite (parallel sessions, killed
+  // /ctx-upgrade run, manual cache surgery). Resolves currentVersion from
+  // the plugin's own manifest — no env-var dependency, immune to PATH bugs.
+  // Best-effort, never blocks session start.
+  try {
+    const { selfHealShellSnapshots } = await import("./cache-heal-utils.mjs");
+    const { resolve } = await import("node:path");
+    const { resolveConfigDir } = await import("./session-helpers.mjs");
+
+    // Read the version this MCP boot is running under. PLUGIN_ROOT
+    // points at ~/.claude/plugins/cache/context-mode/context-mode/<vX>/.
+    let currentVersion = null;
+    try {
+      const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT
+        ?? resolve(HOOK_DIR, "..");
+      const manifestPath = resolve(pluginRoot, ".claude-plugin", "plugin.json");
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      if (typeof manifest?.version === "string" && manifest.version) {
+        currentVersion = manifest.version;
+      }
+    } catch { /* missing/malformed manifest — skip self-heal */ }
+
+    if (currentVersion) {
+      const snapshotsDir = resolve(resolveConfigDir(), "shell-snapshots");
+      const pluginCacheRoot = resolve(
+        resolveConfigDir(),
+        "plugins",
+        "cache",
+        "context-mode",
+        "context-mode",
+      );
+      selfHealShellSnapshots({
+        snapshotsDir,
+        pluginCacheRoot,
+        currentVersion,
+      });
+    }
+  } catch { /* best effort, never block session start */ }
+
   let additionalContext = ROUTING_BLOCK;
 
   // ─── #558: surface security init failure as agent-facing context ───
