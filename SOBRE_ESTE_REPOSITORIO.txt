@@ -1,0 +1,55 @@
+REPOSITÓRIO: context-mode
+TIPO: Fork Público (espelho do upstream, branch main)
+LINGUAGEM: TypeScript (runtime Bun)
+URL (seu fork):    https://github.com/odilsonriquelme/context-mode
+UPSTREAM (fork de): https://github.com/mksglu/context-mode
+LICENÇA: Elastic License v2 (ELv2)
+
+DESCRIÇÃO
+---------
+Context Mode é um SERVIDOR MCP que ataca o "problema do contexto" dos agentes de IA por
+3 frentes (não é só redução de tokens, como dizia a descrição antiga):
+
+1. CONTEXT SAVING — ferramentas em sandbox mantêm os dados brutos FORA da janela de
+   contexto. Ex.: 315 KB viram 5.4 KB (98% de redução). Um snapshot do Playwright (56KB),
+   20 issues do GitHub (59KB) etc. não poluem mais o contexto.
+
+2. SESSION CONTINUITY — cada edição de arquivo, operação git, tarefa, erro e decisão do
+   usuário é registrada em SQLite. No compact da conversa, não despeja tudo de volta no
+   contexto: indexa eventos em FTS5 e recupera só o relevante via busca BM25 — o modelo
+   "retoma de onde parou". Sem --continue, a sessão anterior é apagada (slate limpo).
+
+3. THINK IN CODE — o LLM deve PROGRAMAR a análise, não computá-la na cabeça. Em vez de ler
+   50 arquivos para contar funções, o agente escreve um script que conta e dá console.log só
+   do resultado. Um script substitui 10 tool calls e economiza ~100x de contexto.
+
+MULTI-PLATAFORMA (12 plataformas via adapters)
+-----------------------------------------------
+src/adapters/ tem um adapter por plataforma, cada um com config + hooks:
+   claude-code, codex, cursor, gemini-cli, kiro, openclaw, opencode, vscode-copilot,
+   zed, antigravity (+ detecção automática em detect.ts e client-map.ts).
+Plataformas "hook-capable" ganham roteamento automático; as demais precisam de uma cópia
+única de arquivo de roteamento. Instala no Claude Code via plugin marketplace.
+
+ESTRUTURA PRINCIPAL
+-------------------
+src/adapters/   → integração por plataforma (config.ts + hooks.ts + index.ts cada)
+src/session/    → continuidade de sessão (SQLite, FTS5/BM25)
+src/dashboard/  → painel de visualização
+src/openclaw/   → integração específica do OpenClaw
+src/cli.ts      → interface de linha de comando
+cli.bundle.mjs / server.bundle.mjs → bundles prontos (CLI e servidor MCP)
+configs/, hooks/, skills/, scripts/, web/, docs/ → configs, hooks, skills, web e docs
+tests/          → testes (Vitest): executor, security, store, formatters, truncate-removal,
+                  session-hooks-smoke, context-comparison, live-benchmark
+BENCHMARK.md    → resultados de redução de contexto
+PRD-context-mode-ops.md → documento de requisitos (PRD) do produto
+CLAUDE.md       → instruções para o Claude Code operar no projeto
+llms.txt / llms-full.txt → resumos para consumo por LLM
+package.json    → pacote npm "context-mode"
+
+OBSERVAÇÃO (fork)
+-----------------
+Fork espelho do upstream mksglu/context-mode (licença ELv2 — atenção às restrições de uso
+comercial dessa licença). README/código são de terceiros — não editar. Push deste repo vai
+só para o SEU fork. Tema relacionado ao everything-claude-code (otimização de agentes).
