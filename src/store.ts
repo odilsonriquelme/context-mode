@@ -9,11 +9,13 @@
  */
 
 import type { Database as DatabaseInstance } from "better-sqlite3";
-import { loadDatabase, applyWALPragmas, closeDB, withRetry } from "./db-base.js";
+import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, readdirSync, unlinkSync, existsSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { walkDirectoryDetailed, type WalkOptions } from "./store-directory.js";
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -31,9 +33,12 @@ type SearchRow = {
   title: string;
   content: string;
   content_type: string;
+  timestamp: string | null;
   label: string;
   rank: number;
   highlighted: string;
+  /** Attribution session_id (empty string for legacy unattributed chunks). */
+  session_id: string;
 };
 
 import type { IndexResult, SearchResult, StoreStats } from "./types.js";
@@ -63,26 +68,60 @@ const STOPWORDS = new Set([
 // Helpers
 // ─────────────────────────────────────────────────────────
 
-function sanitizeQuery(query: string, mode: "AND" | "OR" = "AND"): string {
-  const words = query
-    .replace(/['"(){}[\]*:^~]/g, " ")
-    .split(/\s+/)
-    .filter(
-      (w) =>
-        w.length > 0 &&
-        !["AND", "OR", "NOT", "NEAR"].includes(w.toUpperCase()),
-    );
-
-  if (words.length === 0) return '""';
-  return words.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
+/**
+ * Remove case-insensitive duplicate tokens while preserving the first
+ * occurrence's original casing. FTS5's unicode61 tokenizer lowercases on
+ * both sides, so `"Error" OR "error"` produces no extra recall — just
+ * redundant index lookups. Dedup keeps the compiled query minimal.
+ */
+function dedupeTokens(tokens: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const t of tokens) {
+    const key = t.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(t);
+    }
+  }
+  return out;
 }
 
-function sanitizeTrigramQuery(query: string, mode: "AND" | "OR" = "AND"): string {
+export function sanitizeQuery(query: string, mode: "AND" | "OR" = "AND"): string {
+  const words = dedupeTokens(
+    query
+      .replace(/['"(){}[\]*:^~]/g, " ")
+      .split(/\s+/)
+      .filter(
+        (w) =>
+          w.length > 0 &&
+          !["AND", "OR", "NOT", "NEAR"].includes(w.toUpperCase()),
+      ),
+  );
+
+  if (words.length === 0) return '""';
+
+  // Filter stopwords to improve BM25 ranking — common terms like "update",
+  // "test", "fix" appear everywhere and dilute relevance scoring.
+  // Fall back to unfiltered words if ALL terms are stopwords.
+  const meaningful = words.filter((w) => !STOPWORDS.has(w.toLowerCase()));
+  const final = meaningful.length > 0 ? meaningful : words;
+
+  return final.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
+}
+
+export function sanitizeTrigramQuery(query: string, mode: "AND" | "OR" = "AND"): string {
   const cleaned = query.replace(/["'(){}[\]*:^~]/g, "").trim();
   if (cleaned.length < 3) return "";
-  const words = cleaned.split(/\s+/).filter((w) => w.length >= 3);
+  const words = dedupeTokens(
+    cleaned.split(/\s+/).filter((w) => w.length >= 3),
+  );
   if (words.length === 0) return "";
-  return words.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
+
+  const meaningful = words.filter((w) => !STOPWORDS.has(w.toLowerCase()));
+  const final = meaningful.length > 0 ? meaningful : words;
+
+  return final.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
 }
 
 function levenshtein(a: string, b: string): number {
@@ -112,6 +151,23 @@ function maxEditDistance(wordLength: number): number {
 // length normalization and produce unwieldy search results. Split at paragraph
 // boundaries when a chunk exceeds this cap.
 const MAX_CHUNK_BYTES = 4096;
+
+// Blank-line sectioning is used only for output that is *naturally* sectioned:
+// at least a few sections, not an unbounded explosion, and no single section so
+// large that the split is clearly not the real structure (those fall back to
+// line-grouping). Sections that pass the heuristic but still exceed
+// MAX_CHUNK_BYTES are sub-split so no persisted chunk breaks the cap.
+const MIN_BLANK_LINE_SECTIONS = 3;
+const MAX_BLANK_LINE_SECTIONS = 200;
+const BLANK_SECTION_STRATEGY_MAX_BYTES = 5000;
+
+// Number of leading characters of a chunk's first line used as its title.
+const CHUNK_TITLE_MAX_CHARS = 80;
+
+// When byte-splitting an oversized single line, prefer to break at a whitespace
+// boundary for readability — but only if that boundary is past this fraction of
+// the slice, otherwise we'd waste too much of the byte budget.
+const WHITESPACE_BREAK_RATIO = 0.5;
 
 // ─────────────────────────────────────────────────────────
 // ContentStore
@@ -218,6 +274,43 @@ function findAllPositions(text: string, term: string): number[] {
 }
 
 /**
+ * Count matched adjacent pairs across consecutive query terms.
+ * For each pair (term[i], term[i+1]), pairs each left position with at most one
+ * right position whose offset falls within `gap` chars of `p + len(term[i])`.
+ * `positionLists` must be sorted ascending (output of `findAllPositions` is).
+ * Each right position is consumed by at most one left, so `"foo foo bar"`
+ * counts 1 pair, not 2 — matches IR phrase-occurrence intent and avoids
+ * inflating boosts for repeated-token queries.
+ * Used by reranker to layer a frequency signal on top of minSpan proximity:
+ * 30-char gap covers natural prose without rewarding distant matches.
+ */
+function countAdjacentPairs(
+  positionLists: number[][],
+  terms: string[],
+  gap: number = 30,
+): number {
+  if (positionLists.length < 2 || terms.length < 2) return 0;
+  let total = 0;
+  const pairs = Math.min(positionLists.length, terms.length) - 1;
+  for (let i = 0; i < pairs; i++) {
+    const left = positionLists[i];
+    const right = positionLists[i + 1];
+    const leftLen = terms[i].length;
+    let j = 0;
+    for (const p of left) {
+      const minStart = p + leftLen;
+      const maxStart = minStart + gap;
+      while (j < right.length && right[j] < minStart) j++;
+      if (j < right.length && right[j] <= maxStart) {
+        total++;
+        j++;
+      }
+    }
+  }
+  return total;
+}
+
+/**
  * Find minimum span (window) covering at least one position from each list.
  * Uses a sweep-line approach: advance the pointer at the current minimum.
  */
@@ -225,7 +318,7 @@ function findMinSpan(positionLists: number[][]): number {
   if (positionLists.length === 0) return Infinity;
   if (positionLists.length === 1) return 0;
 
-  const sorted = positionLists.map((p) => [...p].sort((a, b) => a - b));
+  const sorted = positionLists;
   const ptrs = new Array(sorted.length).fill(0);
   let minSpan = Infinity;
 
@@ -258,6 +351,13 @@ function findMinSpan(positionLists: number[][]): number {
 export class ContentStore {
   #db: DatabaseInstance;
   #dbPath: string;
+  // Optional deny-policy callback. When set (by server.ts at startup),
+  // #refreshStaleSources consults it before re-reading file_path during
+  // auto-refresh. This catches policy edits between initial indexing and
+  // a later search: a file that was allowed at index time may have been
+  // added to the Read deny list afterwards. Without this hook, refresh
+  // would re-read and re-expose the file. See #442 round-3.
+  #denyChecker?: (filePath: string) => boolean;
 
   // ── Cached Prepared Statements ──
   // Prepared once at construction, reused on every call to avoid
@@ -298,12 +398,52 @@ export class ContentStore {
   #stmtStats!: PreparedStatement;
   #stmtSourceMeta!: PreparedStatement;
 
+  // Cleanup path
+  #stmtCleanupChunks!: PreparedStatement;
+  #stmtCleanupChunksTrigram!: PreparedStatement;
+  #stmtCleanupSources!: PreparedStatement;
+
+  // FTS5 optimization: track inserts and optimize periodically to defragment
+  // the index. FTS5 b-trees fragment over many insert/delete cycles, degrading
+  // search performance. SQLite's built-in 'optimize' merges b-tree segments.
+  #insertCount = 0;
+  static readonly OPTIMIZE_EVERY = 50;
+
+  // Fuzzy correction cache (process-local LRU). fuzzyCorrect() hits the vocab
+  // DB and runs levenshtein against every candidate within length tolerance,
+  // which is CPU-linear in |candidates|. Repeated queries ("erro", "erro" …)
+  // recompute the same answer. The vocabulary table is insert-only, so cache
+  // entries only become stale when new words enter — we clear on actual insert.
+  #fuzzyCache = new Map<string, string | null>();
+  static readonly FUZZY_CACHE_SIZE = 256;
+
   constructor(dbPath?: string) {
     const Database = loadDatabase();
     this.#dbPath =
       dbPath ?? join(tmpdir(), `context-mode-${process.pid}.db`);
-    this.#db = new Database(this.#dbPath, { timeout: 30000 });
-    applyWALPragmas(this.#db);
+    cleanOrphanedWALFiles(this.#dbPath);
+    let db: DatabaseInstance;
+    try {
+      db = new Database(this.#dbPath, { timeout: 30000 });
+      applyWALPragmas(db);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isSQLiteCorruptionError(msg)) {
+        deleteDBFiles(this.#dbPath);
+        cleanOrphanedWALFiles(this.#dbPath);
+        try {
+          db = new Database(this.#dbPath, { timeout: 30000 });
+          applyWALPragmas(db);
+        } catch (retryErr) {
+          throw new Error(
+            `Failed to create fresh DB after deleting corrupt file: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
+          );
+        }
+      } else {
+        throw err;
+      }
+    }
+    this.#db = db;
     this.#initSchema();
     this.#prepareStatements();
   }
@@ -327,7 +467,9 @@ export class ContentStore {
         label TEXT NOT NULL,
         chunk_count INTEGER NOT NULL DEFAULT 0,
         code_chunk_count INTEGER NOT NULL DEFAULT 0,
-        indexed_at TEXT NOT NULL DEFAULT (datetime('now'))
+        indexed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        file_path TEXT,
+        content_hash TEXT
       );
 
       CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
@@ -335,6 +477,10 @@ export class ContentStore {
         content,
         source_id UNINDEXED,
         content_type UNINDEXED,
+        source_category UNINDEXED,
+        session_id UNINDEXED,
+        event_id UNINDEXED,
+        timestamp UNINDEXED,
         tokenize='porter unicode61'
       );
 
@@ -343,6 +489,10 @@ export class ContentStore {
         content,
         source_id UNINDEXED,
         content_type UNINDEXED,
+        source_category UNINDEXED,
+        session_id UNINDEXED,
+        event_id UNINDEXED,
+        timestamp UNINDEXED,
         tokenize='trigram'
       );
 
@@ -352,21 +502,68 @@ export class ContentStore {
 
       CREATE INDEX IF NOT EXISTS idx_sources_label ON sources(label);
     `);
+
+    // FTS5 schema migration: old schema (4 cols) → new schema (8 cols).
+    // FTS5 virtual tables do not support ALTER TABLE ADD COLUMN, so we must
+    // DROP + re-CREATE. Detection: check for sentinel column `source_category`
+    // via pragma_table_xinfo. Three states:
+    //   1. No table          → CREATE above handled it (fresh DB)
+    //   2. Old schema (4 cols) → DROP + CREATE new
+    //   3. New schema (8 cols) → do nothing
+    try {
+      const cols = this.#db.prepare(
+        "SELECT name FROM pragma_table_xinfo('chunks')"
+      ).all() as Array<{ name: string }>;
+      const colNames = new Set(cols.map(c => c.name));
+      if (cols.length > 0 && !colNames.has("source_category")) {
+        // Old schema detected — drop both FTS5 tables and re-create with new columns
+        this.#db.exec("DROP TABLE IF EXISTS chunks");
+        this.#db.exec("DROP TABLE IF EXISTS chunks_trigram");
+        this.#db.exec(`
+          CREATE VIRTUAL TABLE chunks USING fts5(
+            title,
+            content,
+            source_id UNINDEXED,
+            content_type UNINDEXED,
+            source_category UNINDEXED,
+            session_id UNINDEXED,
+            event_id UNINDEXED,
+            timestamp UNINDEXED,
+            tokenize='porter unicode61'
+          );
+          CREATE VIRTUAL TABLE chunks_trigram USING fts5(
+            title,
+            content,
+            source_id UNINDEXED,
+            content_type UNINDEXED,
+            source_category UNINDEXED,
+            session_id UNINDEXED,
+            event_id UNINDEXED,
+            timestamp UNINDEXED,
+            tokenize='trigram'
+          );
+        `);
+      }
+    } catch { /* pragma_table_xinfo may fail if table doesn't exist yet — safe to ignore */ }
+
+    // Stale detection columns — safe for existing DBs (ALTER is O(1) in SQLite)
+    try { this.#db.exec("ALTER TABLE sources ADD COLUMN file_path TEXT"); } catch { /* already exists */ }
+    try { this.#db.exec("ALTER TABLE sources ADD COLUMN content_hash TEXT"); } catch { /* already exists */ }
   }
 
   #prepareStatements(): void {
     // Write path
     this.#stmtInsertSourceEmpty = this.#db.prepare(
-      "INSERT INTO sources (label, chunk_count, code_chunk_count) VALUES (?, 0, 0)",
+      "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash) VALUES (?, 0, 0, ?, ?)",
     );
     this.#stmtInsertSource = this.#db.prepare(
-      "INSERT INTO sources (label, chunk_count, code_chunk_count) VALUES (?, ?, ?)",
+      "INSERT INTO sources (label, chunk_count, code_chunk_count, file_path, content_hash) VALUES (?, ?, ?, ?, ?)",
     );
     this.#stmtInsertChunk = this.#db.prepare(
-      "INSERT INTO chunks (title, content, source_id, content_type) VALUES (?, ?, ?, ?)",
+      "INSERT INTO chunks (title, content, source_id, content_type, source_category, session_id, event_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     );
     this.#stmtInsertChunkTrigram = this.#db.prepare(
-      "INSERT INTO chunks_trigram (title, content, source_id, content_type) VALUES (?, ?, ?, ?)",
+      "INSERT INTO chunks_trigram (title, content, source_id, content_type, source_category, session_id, event_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     );
     this.#stmtInsertVocab = this.#db.prepare(
       "INSERT OR IGNORE INTO vocabulary (word) VALUES (?)",
@@ -390,9 +587,11 @@ export class ContentStore {
         chunks.title,
         chunks.content,
         chunks.content_type,
+        chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ?
@@ -404,12 +603,14 @@ export class ContentStore {
         chunks.title,
         chunks.content,
         chunks.content_type,
+        chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
-      WHERE chunks MATCH ? AND sources.label LIKE ?
+      WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\'
       ORDER BY rank
       LIMIT ?
     `);
@@ -418,9 +619,11 @@ export class ContentStore {
         chunks.title,
         chunks.content,
         chunks.content_type,
+        chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND sources.label = ?
@@ -432,9 +635,11 @@ export class ContentStore {
         chunks_trigram.title,
         chunks_trigram.content,
         chunks_trigram.content_type,
+        chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ?
@@ -446,12 +651,14 @@ export class ContentStore {
         chunks_trigram.title,
         chunks_trigram.content,
         chunks_trigram.content_type,
+        chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
-      WHERE chunks_trigram MATCH ? AND sources.label LIKE ?
+      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\'
       ORDER BY rank
       LIMIT ?
     `);
@@ -460,9 +667,11 @@ export class ContentStore {
         chunks_trigram.title,
         chunks_trigram.content,
         chunks_trigram.content_type,
+        chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND sources.label = ?
@@ -476,9 +685,11 @@ export class ContentStore {
         chunks.title,
         chunks.content,
         chunks.content_type,
+        chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND chunks.content_type = ?
@@ -490,12 +701,14 @@ export class ContentStore {
         chunks.title,
         chunks.content,
         chunks.content_type,
+        chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
-      WHERE chunks MATCH ? AND sources.label LIKE ? AND chunks.content_type = ?
+      WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -504,9 +717,11 @@ export class ContentStore {
         chunks.title,
         chunks.content,
         chunks.content_type,
+        chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND sources.label = ? AND chunks.content_type = ?
@@ -518,9 +733,11 @@ export class ContentStore {
         chunks_trigram.title,
         chunks_trigram.content,
         chunks_trigram.content_type,
+        chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND chunks_trigram.content_type = ?
@@ -532,12 +749,14 @@ export class ContentStore {
         chunks_trigram.title,
         chunks_trigram.content,
         chunks_trigram.content_type,
+        chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
-      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? AND chunks_trigram.content_type = ?
+      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks_trigram.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -546,9 +765,11 @@ export class ContentStore {
         chunks_trigram.title,
         chunks_trigram.content,
         chunks_trigram.content_type,
+        chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND sources.label = ? AND chunks_trigram.content_type = ?
@@ -579,7 +800,7 @@ export class ContentStore {
       "SELECT content FROM chunks WHERE source_id = ?",
     );
     this.#stmtSourceMeta = this.#db.prepare(
-      "SELECT label, chunk_count, code_chunk_count, indexed_at FROM sources WHERE label = ?",
+      "SELECT label, chunk_count, code_chunk_count, indexed_at, file_path, content_hash FROM sources WHERE label = ?",
     );
     this.#stmtStats = this.#db.prepare(`
       SELECT
@@ -587,6 +808,29 @@ export class ContentStore {
         (SELECT COUNT(*) FROM chunks) AS chunks,
         (SELECT COUNT(*) FROM chunks WHERE content_type = 'code') AS codeChunks
     `);
+
+    // Cleanup path — cached to avoid recompiling SQL on each periodic call
+    this.#stmtCleanupChunks = this.#db.prepare(
+      "DELETE FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days'))",
+    );
+    this.#stmtCleanupChunksTrigram = this.#db.prepare(
+      "DELETE FROM chunks_trigram WHERE source_id IN (SELECT id FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days'))",
+    );
+    this.#stmtCleanupSources = this.#db.prepare(
+      "DELETE FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days')",
+    );
+  }
+
+  // ── Deny Policy Hook ──
+
+  /**
+   * Register a deny-policy checker. When set, #refreshStaleSources
+   * calls it before re-reading any file_path during auto-refresh.
+   * Returning `true` causes the source to be skipped (kept in cache,
+   * not re-indexed). server.ts wires this to the Read deny patterns.
+   */
+  setDenyChecker(fn: ((filePath: string) => boolean) | undefined): void {
+    this.#denyChecker = fn;
   }
 
   // ── Index ──
@@ -595,18 +839,121 @@ export class ContentStore {
     content?: string;
     path?: string;
     source?: string;
+    /**
+     * Optional FK metadata recorded on each indexed chunk so per-session
+     * honest-savings stats can join chunks → session_events. When omitted,
+     * chunks fall back to empty-string columns (legacy behaviour).
+     */
+    attribution?: { sessionId?: string; eventId?: string };
   }): IndexResult {
-    const { content, path, source } = options;
+    const { content, path, source, attribution } = options;
 
-    if (!content && !path) {
+    // Treat empty string as "no content" so an empty `content` paired with a
+    // valid `path` falls back to reading the file. Some MCP clients
+    // materialize optional string fields as `""` and the previous
+    // `content ?? readFileSync(path)` kept the empty string, indexing 0
+    // chunks. See issue #350.
+    const hasContent = typeof content === "string" && content.length > 0;
+
+    if (!hasContent && !path) {
       throw new Error("Either content or path must be provided");
     }
 
-    const text = content ?? readFileSync(path!, "utf-8");
+    // Read file via fd to close the TOCTOU window between the security
+    // gate (security.ts evaluateFilePath calls realpathSync) and the read
+    // here. Lexical re-read by path string allowed an attacker to swap a
+    // symlink to a denied target (e.g. ~/.ssh/id_rsa) AFTER gate passed.
+    // openSync + fstat + readFileSync(fd) binds the read to the inode
+    // captured at gate-time. fstat also rejects non-regular files
+    // (directories, character devices) which would otherwise read as ""
+    // or throw inconsistently. See #442 round-3.
+    let text: string;
+    if (hasContent) {
+      text = content!;
+    } else {
+      const fd = openSync(path!, "r");
+      try {
+        const st = fstatSync(fd);
+        if (!st.isFile()) {
+          throw new Error(`refusing to index ${path}: not a regular file`);
+        }
+        text = readFileSync(fd, "utf-8");
+      } finally {
+        closeSync(fd);
+      }
+    }
     const label = source ?? path ?? "untitled";
     const chunks = this.#chunkMarkdown(text);
 
-    return withRetry(() => this.#insertChunks(chunks, label, text));
+    // Stale detection: store file_path + SHA-256 for file-backed sources
+    const filePath = path ?? undefined;
+    const contentHash = filePath ? createHash("sha256").update(text).digest("hex") : undefined;
+
+    return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash, attribution));
+  }
+
+  // ── Index Directory (#687) ──
+
+  /**
+   * Index every file under a directory by walking it with `walkDirectory` and
+   * delegating each discovered file to `this.index({ path })`. The per-file
+   * `openSync + fstatSync.isFile()` security gate at line ~845 stays active
+   * for every file — directory support never bypasses the TOCTOU defense
+   * from #442 round-3.
+   *
+   * Reported by @matiasduartee in #687.
+   */
+  indexDirectory(opts: {
+    path: string;
+    source?: string;
+    attribution?: { sessionId?: string; eventId?: string };
+    /** Optional per-file deny check — runs INSIDE the walk loop so a denied
+     *  file does not even open a fd. Returns true to deny. */
+    perFileDeny?: (absPath: string) => boolean;
+  } & WalkOptions): {
+    filesIndexed: number;
+    totalChunks: number;
+    capped: boolean;
+    totalSeen: number;
+    denied: number;
+    failed: number;
+    label: string;
+  } {
+    const { path: rootPath, source, attribution, perFileDeny, ...walkOpts } = opts;
+    const walked = walkDirectoryDetailed(rootPath, walkOpts);
+
+    let filesIndexed = 0;
+    let totalChunks = 0;
+    let denied = 0;
+    let failed = 0;
+
+    for (const file of walked.files) {
+      if (perFileDeny && perFileDeny(file)) {
+        denied++;
+        continue;
+      }
+      try {
+        // Per-file source label so ctx_search(source: "<file>") still works.
+        const fileSource = source ? `${source}:${file}` : file;
+        const r = this.index({ path: file, source: fileSource, attribution });
+        filesIndexed++;
+        totalChunks += r.totalChunks;
+      } catch {
+        // Per-file failure (e.g. fd-bound fstat rejection of a non-regular
+        // file that races between walk and read) — count + continue.
+        failed++;
+      }
+    }
+
+    return {
+      filesIndexed,
+      totalChunks,
+      capped: walked.capped,
+      totalSeen: walked.totalSeen,
+      denied,
+      failed,
+      label: source ?? rootPath,
+    };
   }
 
   // ── Index Plain Text ──
@@ -620,18 +967,23 @@ export class ContentStore {
     content: string,
     source: string,
     linesPerChunk: number = 20,
+    attribution?: { sessionId?: string; eventId?: string },
+    maxChunkBytes: number = MAX_CHUNK_BYTES,
   ): IndexResult {
     if (!content || content.trim().length === 0) {
-      return this.#insertChunks([], source, "");
+      return this.#insertChunks([], source, "", undefined, undefined, attribution);
     }
 
-    const chunks = this.#chunkPlainText(content, linesPerChunk);
+    const chunks = this.#chunkPlainText(content, linesPerChunk, maxChunkBytes);
 
-    return this.#insertChunks(
+    return withRetry(() => this.#insertChunks(
       chunks.map((c) => ({ ...c, hasCode: false })),
       source,
       content,
-    );
+      undefined,
+      undefined,
+      attribution,
+    ));
   }
 
   // ── Index JSON ──
@@ -647,26 +999,27 @@ export class ContentStore {
     content: string,
     source: string,
     maxChunkBytes: number = MAX_CHUNK_BYTES,
+    attribution?: { sessionId?: string; eventId?: string },
   ): IndexResult {
     if (!content || content.trim().length === 0) {
-      return this.indexPlainText("", source);
+      return this.indexPlainText("", source, undefined, attribution, maxChunkBytes);
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(content);
     } catch {
-      return this.indexPlainText(content, source);
+      return this.indexPlainText(content, source, undefined, attribution, maxChunkBytes);
     }
 
     const chunks: Chunk[] = [];
     this.#walkJSON(parsed, [], chunks, maxChunkBytes);
 
     if (chunks.length === 0) {
-      return this.indexPlainText(content, source);
+      return this.indexPlainText(content, source, undefined, attribution, maxChunkBytes);
     }
 
-    return this.#insertChunks(chunks, source, content);
+    return withRetry(() => this.#insertChunks(chunks, source, content, undefined, undefined, attribution));
   }
 
   // ── Shared DB Insertion ──
@@ -676,8 +1029,19 @@ export class ContentStore {
    * into both FTS5 tables within a transaction and extracts vocabulary.
    * Uses cached prepared statements from #prepareStatements().
    */
-  #insertChunks(chunks: Chunk[], label: string, text: string): IndexResult {
+  #insertChunks(
+    chunks: Chunk[],
+    label: string,
+    text: string,
+    filePath?: string,
+    contentHash?: string,
+    attribution?: { sessionId?: string; eventId?: string },
+  ): IndexResult {
     const codeChunks = chunks.filter((c) => c.hasCode).length;
+    // FK columns on chunks. Empty-string fallback preserves the FTS5-friendly
+    // "not-null but unattributed" sentinel used by legacy rows.
+    const sessionIdCol = attribution?.sessionId ?? "";
+    const eventIdCol = attribution?.eventId ?? "";
 
     // Atomic dedup + insert: delete previous source with same label,
     // then insert new content — all within a single transaction.
@@ -688,17 +1052,18 @@ export class ContentStore {
       this.#stmtDeleteSourcesByLabel.run(label);
 
       if (chunks.length === 0) {
-        const info = this.#stmtInsertSourceEmpty.run(label);
+        const info = this.#stmtInsertSourceEmpty.run(label, filePath ?? null, contentHash ?? null);
         return Number(info.lastInsertRowid);
       }
 
-      const info = this.#stmtInsertSource.run(label, chunks.length, codeChunks);
+      const info = this.#stmtInsertSource.run(label, chunks.length, codeChunks, filePath ?? null, contentHash ?? null);
       const sourceId = Number(info.lastInsertRowid);
 
+      const now = new Date().toISOString();
       for (const chunk of chunks) {
         const ct = chunk.hasCode ? "code" : "prose";
-        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct);
-        this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct);
+        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
+        this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
       }
 
       return sourceId;
@@ -706,6 +1071,15 @@ export class ContentStore {
 
     const sourceId = transaction();
     if (text) this.#extractAndStoreVocabulary(text);
+
+    // Periodically optimize FTS5 indexes to merge b-tree segments.
+    // Fragmentation accumulates over insert/delete cycles (dedup re-indexes
+    // every source on update). The 'optimize' command merges segments into
+    // a single b-tree, improving search latency for long-running sessions.
+    this.#insertCount++;
+    if (this.#insertCount % ContentStore.OPTIMIZE_EVERY === 0) {
+      this.#optimizeFTS();
+    }
 
     return {
       sourceId,
@@ -725,11 +1099,24 @@ export class ContentStore {
       rank: r.rank,
       contentType: r.content_type as "code" | "prose",
       highlighted: r.highlighted,
+      timestamp: r.timestamp ?? undefined,
+      sessionId: r.session_id ?? "",
     }));
   }
 
   #sourceFilterParam(source: string, sourceMatchMode: SourceMatchMode): string {
-    return sourceMatchMode === "exact" ? source : `%${source}%`;
+    if (sourceMatchMode === "exact") return source;
+    // Escape SQLite LIKE metacharacters so user-supplied source labels
+    // containing `_`, `%`, or `\` are matched literally rather than as
+    // wildcards. Backslash must be replaced first (otherwise subsequent
+    // escapes would themselves be re-escaped). Paired with `ESCAPE '\'`
+    // in the four prepared LIKE statements (#stmtSearchPorter*,
+    // #stmtSearchTrigram*). Regression: #646.
+    const escaped = source
+      .replace(/\\/g, "\\\\")
+      .replace(/%/g, "\\%")
+      .replace(/_/g, "\\_");
+    return `%${escaped}%`;
   }
 
   search(
@@ -800,7 +1187,7 @@ export class ContentStore {
       params = [sanitized, limit];
     }
 
-    return this.#mapSearchRows(stmt.all(...params) as SearchRow[]);
+    return withRetry(() => this.#mapSearchRows(stmt.all(...params) as SearchRow[]));
   }
 
   // ── Fuzzy Correction (Layer 3) ──
@@ -808,6 +1195,14 @@ export class ContentStore {
   fuzzyCorrect(query: string): string | null {
     const word = query.toLowerCase().trim();
     if (word.length < 3) return null;
+
+    // Cache hit: promote to tail (Map preserves insertion order → LRU).
+    if (this.#fuzzyCache.has(word)) {
+      const cached = this.#fuzzyCache.get(word) ?? null;
+      this.#fuzzyCache.delete(word);
+      this.#fuzzyCache.set(word, cached);
+      return cached;
+    }
 
     const maxDist = maxEditDistance(word.length);
 
@@ -818,9 +1213,13 @@ export class ContentStore {
 
     let bestWord: string | null = null;
     let bestDist = maxDist + 1;
+    let exactMatch = false;
 
     for (const { word: candidate } of candidates) {
-      if (candidate === word) return null; // exact match — no correction
+      if (candidate === word) {
+        exactMatch = true;
+        break;
+      }
       const dist = levenshtein(word, candidate);
       if (dist < bestDist) {
         bestDist = dist;
@@ -828,7 +1227,16 @@ export class ContentStore {
       }
     }
 
-    return bestDist <= maxDist ? bestWord : null;
+    const result = exactMatch ? null : bestDist <= maxDist ? bestWord : null;
+
+    // Evict the oldest entry before insert if we hit the size cap.
+    if (this.#fuzzyCache.size >= ContentStore.FUZZY_CACHE_SIZE) {
+      const oldestKey = this.#fuzzyCache.keys().next().value;
+      if (oldestKey !== undefined) this.#fuzzyCache.delete(oldestKey);
+    }
+    this.#fuzzyCache.set(word, result);
+
+    return result;
   }
 
   // ── Reciprocal Rank Fusion (Cormack et al. 2009) ──
@@ -881,27 +1289,47 @@ export class ContentStore {
     results: SearchResult[],
     query: string,
   ): SearchResult[] {
-    const terms = query
+    const allTerms = query
       .toLowerCase()
       .split(/\s+/)
       .filter((w) => w.length >= 2);
-
-    // Single-term queries: no reranking needed
-    if (terms.length < 2) return results;
+    // Exclude stopwords from proximity/title scoring — they match everywhere
+    // and inflate boosts for irrelevant chunks. Keep all terms as fallback.
+    const filtered = allTerms.filter((w) => !STOPWORDS.has(w));
+    const terms = filtered.length > 0 ? filtered : allTerms;
 
     return results
       .map((r) => {
-        const content = r.content.toLowerCase();
-        const positions = terms.map((t) => findAllPositions(content, t));
+        // Title-match boost: query terms found in the chunk title get a boost.
+        // Code chunks get a stronger title boost (function/class names are high
+        // signal) while prose chunks get a moderate one (headings are useful but
+        // body carries more weight).
+        const titleLower = r.title.toLowerCase();
+        const titleHits = terms.filter((t) => titleLower.includes(t)).length;
+        const titleWeight = r.contentType === "code" ? 0.6 : 0.3;
+        const titleBoost = titleHits > 0 ? titleWeight * (titleHits / terms.length) : 0;
 
-        // If any term is missing from content, no proximity boost
-        if (positions.some((p) => p.length === 0)) {
-          return { result: r, boost: 0 };
+        // Proximity boost for multi-term queries. minSpan picks the single
+        // tightest window — frequency doesn't move it, so a long doc with one
+        // tight occurrence outranks a short doc with several. Phrase-frequency
+        // reward layers a saturating frequency signal on top: cap 0.5 (below
+        // proximity max ≈1.0, in title-boost range), saturates at 4 hits.
+        let proximityBoost = 0;
+        let phraseBoost = 0;
+        if (terms.length >= 2) {
+          const content = r.content.toLowerCase();
+          const positions = terms.map((t) => findAllPositions(content, t));
+
+          if (!positions.some((p) => p.length === 0)) {
+            const minSpan = findMinSpan(positions);
+            proximityBoost = 1 / (1 + minSpan / Math.max(content.length, 1));
+
+            const adjacentPairs = countAdjacentPairs(positions, terms);
+            phraseBoost = 0.5 * Math.min(1, adjacentPairs / 4);
+          }
         }
 
-        const minSpan = findMinSpan(positions);
-        const boost = 1 / (1 + minSpan / Math.max(content.length, 1));
-        return { result: r, boost };
+        return { result: r, boost: titleBoost + proximityBoost + phraseBoost };
       })
       .sort((a, b) => b.boost - a.boost || a.result.rank - b.result.rank)
       .map(({ result }) => result);
@@ -915,28 +1343,44 @@ export class ContentStore {
     source?: string,
     contentType?: "code" | "prose",
     sourceMatchMode: SourceMatchMode = "like",
+    sessionIdAllowSet?: Set<string>,
   ): SearchResult[] {
+    // Step 0: Auto-refresh stale file-backed sources before searching
+    this.#refreshStaleSources();
+
+    // When a session-id allow-set is in play (issue #737 project filter),
+    // fetch a larger candidate pool from the FTS5 layers so the post-filter
+    // can still deliver `limit` matches even if many candidates are excluded.
+    // The cap is bounded — even at the largest installs the chunk count
+    // dwarfs `limit * 8`, and the surplus is dropped on the post-filter.
+    const fetchLimit = sessionIdAllowSet ? Math.max(limit * 8, 40) : limit;
+    const sessionFilter = this.#makeSessionFilter(sessionIdAllowSet);
+
     // Step 1: RRF fusion (porter OR + trigram OR → merge)
-    const rrfResults = this.#rrfSearch(query, limit, source, contentType, sourceMatchMode);
-    if (rrfResults.length > 0) {
-      const reranked = this.#applyProximityReranking(rrfResults, query);
+    const rrfResults = this.#rrfSearch(query, fetchLimit, source, contentType, sourceMatchMode);
+    const rrfFiltered = sessionFilter ? rrfResults.filter(sessionFilter) : rrfResults;
+    if (rrfFiltered.length > 0) {
+      const reranked = this.#applyProximityReranking(rrfFiltered.slice(0, limit), query);
       return reranked.map((r) => ({ ...r, matchLayer: "rrf" as const }));
     }
 
     // Step 2: Fuzzy correction → RRF re-run
+    // Skip stopwords — they'll be filtered by sanitizeQuery anyway, and each
+    // fuzzyCorrect call hits the vocab DB + runs levenshtein comparisons.
     const words = query
       .toLowerCase()
       .trim()
       .split(/\s+/)
-      .filter((w) => w.length >= 3);
+      .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
     const original = words.join(" ");
     const correctedWords = words.map((w) => this.fuzzyCorrect(w) ?? w);
     const correctedQuery = correctedWords.join(" ");
 
     if (correctedQuery !== original) {
-      const fuzzyResults = this.#rrfSearch(correctedQuery, limit, source, contentType, sourceMatchMode);
-      if (fuzzyResults.length > 0) {
-        const reranked = this.#applyProximityReranking(fuzzyResults, correctedQuery);
+      const fuzzyResults = this.#rrfSearch(correctedQuery, fetchLimit, source, contentType, sourceMatchMode);
+      const fuzzyFiltered = sessionFilter ? fuzzyResults.filter(sessionFilter) : fuzzyResults;
+      if (fuzzyFiltered.length > 0) {
+        const reranked = this.#applyProximityReranking(fuzzyFiltered.slice(0, limit), correctedQuery);
         return reranked.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));
       }
     }
@@ -944,12 +1388,82 @@ export class ContentStore {
     return [];
   }
 
+  /**
+   * Build the session-id post-filter for the FTS5 candidate pool. Legacy
+   * chunks indexed before per-session attribution carry `session_id=''` and
+   * stay visible across projects so user-indexed content remains reachable
+   * after opting into the shared-DB mode (#737).
+   */
+  #makeSessionFilter(
+    allowSet: Set<string> | undefined,
+  ): ((r: SearchResult) => boolean) | null {
+    if (!allowSet) return null;
+    return (r: SearchResult) => {
+      const sid = r.sessionId ?? "";
+      return sid === "" || allowSet.has(sid);
+    };
+  }
+
+  /** Number of sources auto-refreshed in the last searchWithFallback call. */
+  lastRefreshCount = 0;
+
+  /**
+   * Check all file-backed sources for staleness and auto re-index changed files.
+   * Uses mtime as a fast gate — only computes SHA-256 when mtime has advanced
+   * past indexed_at. Gracefully skips deleted files and non-file sources.
+   */
+  #refreshStaleSources(): void {
+    this.lastRefreshCount = 0;
+    const sources = this.#db.prepare(
+      "SELECT label, file_path, content_hash, indexed_at FROM sources WHERE file_path IS NOT NULL",
+    ).all() as Array<{ label: string; file_path: string; content_hash: string; indexed_at: string }>;
+
+    for (const src of sources) {
+      try {
+        if (!existsSync(src.file_path)) continue; // file deleted — keep cached results
+        // Re-check deny policy before re-reading. The Read deny list may
+        // have been edited after this source was originally indexed; a
+        // file that was allowed then may now be denied. Without this
+        // gate, refresh would happily re-read and re-expose it. #442 r3.
+        if (this.#denyChecker && this.#denyChecker(src.file_path)) continue;
+        const mtime = statSync(src.file_path).mtime;
+        const indexedAt = new Date(src.indexed_at + "Z");
+        if (mtime <= indexedAt) continue; // file unchanged — fast path
+
+        // mtime advanced — fd-bound read for hash + indexing in one go.
+        // Open once, fstat, read from fd. Closes the swap-mid-flight
+        // window between hash read and re-index. #442 round-3.
+        const fd = openSync(src.file_path, "r");
+        let newContent: string;
+        try {
+          const st = fstatSync(fd);
+          if (!st.isFile()) continue; // skip non-regular targets
+          newContent = readFileSync(fd, "utf-8");
+        } finally {
+          closeSync(fd);
+        }
+        const newHash = createHash("sha256").update(newContent).digest("hex");
+        if (newHash === src.content_hash) continue; // content identical — skip
+
+        // File genuinely changed — re-index using already-read content
+        // (avoids a second open/read race) but preserve file_path/hash
+        // by going through index() which stores them. Since we pass
+        // content, index() does NOT re-read; the bytes hashed above
+        // are exactly the bytes indexed.
+        this.index({ content: newContent, path: src.file_path, source: src.label });
+        this.lastRefreshCount++;
+      } catch {
+        // Graceful degradation — never break search for stale detection
+      }
+    }
+  }
+
   // ── Sources ──
 
-  getSourceMeta(label: string): { label: string; chunkCount: number; codeChunkCount: number; indexedAt: string } | null {
-    const row = this.#stmtSourceMeta.get(label) as { label: string; chunk_count: number; code_chunk_count: number; indexed_at: string } | undefined;
+  getSourceMeta(label: string): { label: string; chunkCount: number; codeChunkCount: number; indexedAt: string; filePath: string | null; contentHash: string | null } | null {
+    const row = this.#stmtSourceMeta.get(label) as { label: string; chunk_count: number; code_chunk_count: number; indexed_at: string; file_path: string | null; content_hash: string | null } | undefined;
     if (!row) return null;
-    return { label: row.label, chunkCount: row.chunk_count, codeChunkCount: row.code_chunk_count, indexedAt: row.indexed_at };
+    return { label: row.label, chunkCount: row.chunk_count, codeChunkCount: row.code_chunk_count, indexedAt: row.indexed_at, filePath: row.file_path ?? null, contentHash: row.content_hash ?? null };
   }
 
   listSources(): Array<{ label: string; chunkCount: number }> {
@@ -957,6 +1471,27 @@ export class ContentStore {
       label: string;
       chunkCount: number;
     }>;
+  }
+
+  /**
+   * Aggregate snapshot of the persistent content store. Returns total
+   * chunk count, source count, and the most recent indexed_at timestamp.
+   * Used by ctx_stats so callers can see observability state in the same
+   * round trip instead of inferring it from snapshot diffs.
+   */
+  getIndexState(): { totalChunks: number; totalSources: number; lastIndexedAt?: string } {
+    const row = (this.#db
+      .prepare("SELECT COALESCE(SUM(chunk_count), 0) AS total_chunks, COUNT(*) AS total_sources, MAX(indexed_at) AS last_indexed_at FROM sources")
+      .get() as {
+        total_chunks: number;
+        total_sources: number;
+        last_indexed_at: string | null;
+      });
+    return {
+      totalChunks: row.total_chunks ?? 0,
+      totalSources: row.total_sources ?? 0,
+      lastIndexedAt: row.last_indexed_at ?? undefined,
+    };
   }
 
   /**
@@ -1051,19 +1586,10 @@ export class ContentStore {
    * Returns count of deleted sources.
    */
   cleanupStaleSources(maxAgeDays: number): number {
-    const deleteChunks = this.#db.prepare(
-      "DELETE FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days'))",
-    );
-    const deleteChunksTrigram = this.#db.prepare(
-      "DELETE FROM chunks_trigram WHERE source_id IN (SELECT id FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days'))",
-    );
-    const deleteSources = this.#db.prepare(
-      "DELETE FROM sources WHERE datetime(indexed_at) < datetime('now', '-' || ? || ' days')",
-    );
     const cleanup = this.#db.transaction((days: number) => {
-      deleteChunks.run(days);
-      deleteChunksTrigram.run(days);
-      return deleteSources.run(days);
+      this.#stmtCleanupChunks.run(days);
+      this.#stmtCleanupChunksTrigram.run(days);
+      return this.#stmtCleanupSources.run(days);
     });
     const info = cleanup(maxAgeDays);
     return info.changes;
@@ -1078,7 +1604,16 @@ export class ContentStore {
     }
   }
 
+  /** Merge FTS5 b-tree segments for both porter and trigram indexes. */
+  #optimizeFTS(): void {
+    try {
+      this.#db.exec("INSERT INTO chunks(chunks) VALUES('optimize')");
+      this.#db.exec("INSERT INTO chunks_trigram(chunks_trigram) VALUES('optimize')");
+    } catch { /* best effort — don't block indexing */ }
+  }
+
   close(): void {
+    this.#optimizeFTS(); // defragment before close
     closeDB(this.#db); // WAL checkpoint before close — important for persistent DBs
   }
 
@@ -1092,11 +1627,18 @@ export class ContentStore {
 
     const unique = [...new Set(words)];
 
+    let inserted = 0;
     this.#db.transaction(() => {
       for (const word of unique) {
-        this.#stmtInsertVocab.run(word);
+        const info = this.#stmtInsertVocab.run(word);
+        inserted += info.changes;
       }
     })();
+
+    // Invalidate fuzzy cache when new vocab words actually land. INSERT OR
+    // IGNORE reports changes=0 for duplicates, so re-indexing identical
+    // content does not thrash the cache during iterative workflows.
+    if (inserted > 0) this.#fuzzyCache.clear();
   }
 
   // ── Chunking ──
@@ -1220,34 +1762,132 @@ export class ContentStore {
     return chunks;
   }
 
+  /**
+   * Return the largest prefix of `str` whose UTF-8 byte length does not exceed
+   * `maxBytes`, walking by Unicode code point so multibyte sequences (CJK) and
+   * surrogate pairs (emoji) are never cut mid-character. Guarantees forward
+   * progress: if even the first code point exceeds `maxBytes`, it is still
+   * returned whole (a 1-4 byte overshoot beats an infinite loop).
+   */
+  #byteCappedPrefix(str: string, maxBytes: number): string {
+    if (Buffer.byteLength(str) <= maxBytes) return str;
+    let prefix = "";
+    let bytes = 0;
+    for (const char of str) {
+      const charBytes = Buffer.byteLength(char);
+      if (bytes + charBytes > maxBytes) break;
+      prefix += char;
+      bytes += charBytes;
+    }
+    // Defensive: a single code point wider than the cap (only possible with a
+    // pathologically small maxBytes) still advances by one character.
+    if (prefix.length === 0) return [...str][0] ?? "";
+    return prefix;
+  }
+
+  /**
+   * Split a single oversized plain-text chunk into byte-capped sub-chunks
+   * by accumulating lines until the byte count would exceed maxChunkBytes.
+   * Falls back to byte-accurate splitting for extremely long single lines.
+   */
+  #splitOversizedPlainChunk(
+    lines: string[],
+    titlePrefix: string,
+    maxChunkBytes: number,
+  ): Array<{ title: string; content: string }> {
+    const subChunks: Array<{ title: string; content: string }> = [];
+    let accumulator: string[] = [];
+    let partIndex = 1;
+
+    const flushAccumulator = () => {
+      if (accumulator.length === 0) return;
+      const content = accumulator.join("\n");
+      const partTitle = partIndex === 1 ? titlePrefix : `${titlePrefix} (${partIndex})`;
+      subChunks.push({ title: partTitle, content });
+      partIndex++;
+      accumulator = [];
+    };
+
+    for (const line of lines) {
+      // If a single line itself exceeds the cap (even as first line),
+      // split it by character before accumulating
+      if (Buffer.byteLength(line) > maxChunkBytes) {
+        flushAccumulator();
+        // Split the long line into byte-capped pieces
+        let remaining = line;
+        let linePart = 1;
+        while (remaining.length > 0) {
+          // Byte-accurate slice: never exceeds the cap, never cuts a multibyte
+          // character (CJK) or surrogate pair (emoji) in half.
+          let slice = this.#byteCappedPrefix(remaining, maxChunkBytes);
+          // Try to break at a whitespace boundary near the end for readability,
+          // but only when text remains after this slice.
+          if (slice.length < remaining.length) {
+            const lastSpace = slice.lastIndexOf(" ");
+            const lastNewline = slice.lastIndexOf("\n");
+            const breakPoint = Math.max(lastSpace, lastNewline);
+            if (breakPoint > slice.length * WHITESPACE_BREAK_RATIO) {
+              slice = slice.slice(0, breakPoint);
+            }
+          }
+          const linePartTitle = partIndex === 1 && linePart === 1
+            ? titlePrefix
+            : `${titlePrefix} (${partIndex}.${linePart})`;
+          subChunks.push({ title: linePartTitle, content: slice });
+          remaining = remaining.slice(slice.length);
+          linePart++;
+          partIndex++;
+        }
+        continue;
+      }
+
+      const candidate = accumulator.length > 0
+        ? accumulator.join("\n") + "\n" + line
+        : line;
+
+      // If adding this line would exceed the cap, flush accumulator first
+      if (Buffer.byteLength(candidate) > maxChunkBytes && accumulator.length > 0) {
+        flushAccumulator();
+      }
+      accumulator.push(line);
+    }
+    flushAccumulator();
+    return subChunks;
+  }
+
   #chunkPlainText(
     text: string,
     linesPerChunk: number,
+    maxChunkBytes: number = MAX_CHUNK_BYTES,
   ): Array<{ title: string; content: string }> {
     // Try blank-line splitting first for naturally-sectioned output
     const sections = text.split(/\n\s*\n/);
     if (
-      sections.length >= 3 &&
-      sections.length <= 200 &&
-      sections.every((s) => Buffer.byteLength(s) < 5000)
+      sections.length >= MIN_BLANK_LINE_SECTIONS &&
+      sections.length <= MAX_BLANK_LINE_SECTIONS &&
+      sections.every((s) => Buffer.byteLength(s) < BLANK_SECTION_STRATEGY_MAX_BYTES)
     ) {
-      return sections
-        .map((section, i) => {
-          const trimmed = section.trim();
-          const firstLine = trimmed.split("\n")[0].slice(0, 80);
-          return {
-            title: firstLine || `Section ${i + 1}`,
-            content: trimmed,
-          };
-        })
-        .filter((s) => s.content.length > 0);
+      return sections.flatMap((section, i) => {
+        const trimmed = section.trim();
+        if (trimmed.length === 0) return [];
+        const title = trimmed.split("\n")[0].slice(0, CHUNK_TITLE_MAX_CHARS) || `Section ${i + 1}`;
+        // A section may pass the strategy guard yet still exceed the byte cap
+        // (4097–4999B band): sub-split it so no stored chunk breaks the cap.
+        if (Buffer.byteLength(trimmed) <= maxChunkBytes) {
+          return [{ title, content: trimmed }];
+        }
+        return this.#splitOversizedPlainChunk(trimmed.split("\n"), title, maxChunkBytes);
+      });
     }
 
     const lines = text.split("\n");
 
-    // Small enough for a single chunk
+    // Small enough for a single chunk — but still enforce byte cap
     if (lines.length <= linesPerChunk) {
-      return [{ title: "Output", content: text }];
+      if (Buffer.byteLength(text) <= maxChunkBytes) {
+        return [{ title: "Output", content: text }];
+      }
+      return this.#splitOversizedPlainChunk(lines, "Output", maxChunkBytes);
     }
 
     // Fixed-size line groups with 2-line overlap
@@ -1260,11 +1900,23 @@ export class ContentStore {
       if (slice.length === 0) break;
       const startLine = i + 1;
       const endLine = Math.min(i + slice.length, lines.length);
-      const firstLine = slice[0]?.trim().slice(0, 80);
-      chunks.push({
-        title: firstLine || `Lines ${startLine}-${endLine}`,
-        content: slice.join("\n"),
-      });
+      const firstLine = slice[0]?.trim().slice(0, CHUNK_TITLE_MAX_CHARS);
+      const joined = slice.join("\n");
+
+      // Enforce byte cap: sub-split oversized line-group chunks
+      if (Buffer.byteLength(joined) <= maxChunkBytes) {
+        chunks.push({
+          title: firstLine || `Lines ${startLine}-${endLine}`,
+          content: joined,
+        });
+      } else {
+        const subChunks = this.#splitOversizedPlainChunk(
+          slice,
+          firstLine || `Lines ${startLine}-${endLine}`,
+          maxChunkBytes,
+        );
+        chunks.push(...subChunks);
+      }
     }
 
     return chunks;

@@ -9,14 +9,20 @@ import "../setup-home";
  */
 
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, rmSync, writeFileSync, unlinkSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { describe, it, expect, test, beforeAll, beforeEach, afterAll, vi } from "vitest";
+import { describe, it, expect, test, beforeAll, beforeEach, afterAll, afterEach, vi } from "vitest";
 import { SessionDB } from "../../src/session/db.js";
 import { OpenClawSessionDB } from "../../src/adapters/openclaw/session-db.js";
-import { extractWorkspace, WorkspaceRouter } from "../../src/openclaw/workspace-router.js";
+import { extractWorkspace, WorkspaceRouter } from "../../src/adapters/openclaw/workspace-router.js";
+
+// MCP readiness sentinel — routing.mjs checks process.ppid in-process
+const _sentinelDir = process.platform === "win32" ? tmpdir() : "/tmp";
+const mcpSentinel = resolve(_sentinelDir, `context-mode-mcp-ready-${process.pid}`);
+beforeEach(() => { writeFileSync(mcpSentinel, String(process.pid)); });
+afterEach(() => { try { unlinkSync(mcpSentinel); } catch {} });
 
 // ═══════════════════════════════════════════════════════════
 // Mock helpers (from openclaw-plugin.test.ts)
@@ -44,6 +50,49 @@ interface MockContextEngine {
   };
 }
 
+function createMockApiWithoutRegisterHook() {
+  const lifecycle: MockLifecycleEntry[] = [];
+  const tools: MockToolEntry[] = [];
+  const commands: MockCommandEntry[] = [];
+  const warnings: unknown[][] = [];
+
+  return {
+    lifecycle,
+    tools,
+    commands,
+    warnings,
+    api: {
+      on(
+        event: string,
+        handler: (...args: unknown[]) => unknown,
+        opts?: { priority?: number },
+      ) {
+        lifecycle.push({ event, handler, opts });
+      },
+      registerCommand(command: unknown) {
+        if (
+          !command ||
+          typeof command !== "object" ||
+          typeof (command as { name?: unknown }).name !== "string" ||
+          typeof (command as { handler?: unknown }).handler !== "function"
+        ) {
+          throw new TypeError("registerCommand(command) expected");
+        }
+        commands.push(command as MockCommandEntry);
+      },
+      registerTool(
+        tool: Omit<MockToolEntry, "optional">,
+        opts?: { optional?: boolean },
+      ) {
+        tools.push({ ...tool, optional: opts?.optional });
+      },
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+      },
+    },
+  };
+}
+
 interface MockCommandEntry {
   name: string;
   description: string;
@@ -52,17 +101,28 @@ interface MockCommandEntry {
   handler: (ctx: Record<string, unknown>) => { text: string } | Promise<{ text: string }>;
 }
 
+interface MockToolEntry {
+  name: string;
+  description: string;
+  parameters: { type: string; properties: Record<string, unknown>; required?: string[] };
+  execute: (id: string, params: Record<string, unknown>) =>
+    Promise<{ content: Array<{ type: "text"; text: string }> }>;
+  optional?: boolean;
+}
+
 function createMockApiFull() {
   const hooks: MockHookEntry[] = [];
   const lifecycle: MockLifecycleEntry[] = [];
   const contextEngines: MockContextEngine[] = [];
   const commands: MockCommandEntry[] = [];
+  const tools: MockToolEntry[] = [];
 
   return {
     hooks,
     lifecycle,
     contextEngines,
     commands,
+    tools,
     api: {
       registerHook(
         event: string,
@@ -87,6 +147,12 @@ function createMockApiFull() {
       registerCommand(cmd: MockCommandEntry) {
         commands.push(cmd);
       },
+      registerTool(
+        tool: Omit<MockToolEntry, "optional">,
+        opts?: { optional?: boolean },
+      ) {
+        tools.push({ ...tool, optional: opts?.optional });
+      },
     },
   };
 }
@@ -98,7 +164,7 @@ function createMockApiFull() {
 async function createTestPlugin(tempDir: string) {
   // Each test gets an isolated DB by running from a unique cwd (tempDir).
   // The plugin reads process.cwd() for projectDir — no fake env var needed.
-  const { default: plugin } = await import("../../src/openclaw-plugin.js");
+  const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
   const mock = createMockApiFull();
   await plugin.register(mock.api);
   return mock;
@@ -186,7 +252,7 @@ describe("OpenClawPlugin", () => {
 
   describe("object export", () => {
     it("exports object with id, name, configSchema, register", async () => {
-      const { default: plugin } = await import("../../src/openclaw-plugin.js");
+      const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
       expect(plugin.id).toBe("context-mode");
       expect(plugin.name).toBe("Context Mode");
       expect(plugin.configSchema).toBeDefined();
@@ -195,7 +261,7 @@ describe("OpenClawPlugin", () => {
     });
 
     it("configSchema has enabled property", async () => {
-      const { default: plugin } = await import("../../src/openclaw-plugin.js");
+      const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
       expect(plugin.configSchema.properties.enabled).toBeDefined();
       expect(plugin.configSchema.properties.enabled.type).toBe("boolean");
       expect(plugin.configSchema.properties.enabled.default).toBe(true);
@@ -241,6 +307,22 @@ describe("OpenClawPlugin", () => {
         expect(hook.meta.name).toMatch(/^context-mode\./);
         expect(hook.meta.description.length).toBeGreaterThan(0);
       }
+    });
+
+    it("degrades gracefully when registerHook and registerContextEngine are unavailable", async () => {
+      const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
+      const mock = createMockApiWithoutRegisterHook();
+
+      expect(() => plugin.register(mock.api as unknown as Parameters<typeof plugin.register>[0]))
+        .not.toThrow();
+      expect(mock.tools.length).toBeGreaterThan(0);
+      expect(mock.commands.map((c) => c.name)).toEqual(
+        expect.arrayContaining(["ctx-stats", "ctx-doctor", "ctx-upgrade"]),
+      );
+      const lifecycleNames = mock.lifecycle.map((h) => h.event);
+      expect(lifecycleNames).toContain("before_tool_call");
+      expect(lifecycleNames).toContain("command:new");
+      expect(mock.warnings.length).toBeGreaterThan(0);
     });
   });
 
@@ -395,6 +477,56 @@ describe("OpenClawPlugin", () => {
     });
   });
 
+  // ── model.usage diagnostic subscription (cost capture wire) ──
+
+  describe("model.usage diagnostic subscription", () => {
+    it("subscribes via api.onDiagnosticEvent and flows a model.usage event to db.insertEvent", async () => {
+      // Capture the listener the plugin registers on the diagnostic bus.
+      let diagListener: ((evt: unknown) => void) | undefined;
+      const mock = createMockApiFull();
+      const api = {
+        ...mock.api,
+        onDiagnosticEvent(listener: (evt: unknown) => void) {
+          diagListener = listener;
+          return () => {};
+        },
+      };
+
+      const insertSpy = vi.spyOn(OpenClawSessionDB.prototype, "insertEvent");
+      insertSpy.mockClear();
+
+      const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
+      await plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
+
+      expect(typeof diagListener).toBe("function");
+
+      // Fire a real model.usage diagnostic payload.
+      diagListener!({
+        type: "model.usage",
+        model: "claude-sonnet-4",
+        usage: { input: 1200, output: 340, cacheRead: 5000, cacheWrite: 800 },
+        costUsd: 0.0421,
+      });
+
+      const usageInsert = insertSpy.mock.calls.find(
+        (c) => (c[1] as { type?: string })?.type === "agent_usage",
+      );
+      expect(usageInsert).toBeDefined();
+      expect((usageInsert![1] as { cost_usd?: number }).cost_usd).toBe(0.0421);
+      expect(usageInsert![2]).toBe("Diagnostic"); // PostToolUse-style source tag
+
+      // Non-usage payloads insert no agent_usage event (best-effort, no throw).
+      const before = insertSpy.mock.calls.length;
+      expect(() => diagListener!({ type: "model.failover" })).not.toThrow();
+      const afterUsage = insertSpy.mock.calls
+        .slice(before)
+        .filter((c) => (c[1] as { type?: string })?.type === "agent_usage");
+      expect(afterUsage).toHaveLength(0);
+
+      insertSpy.mockRestore();
+    });
+  });
+
   // ── command:new ───────────────────────────────────────
 
   describe("command:new", () => {
@@ -410,8 +542,21 @@ describe("OpenClawPlugin", () => {
   // ── before_prompt_build ───────────────────────────────
 
   describe("before_prompt_build", () => {
+    /**
+     * Force the plugin's lazy initPromise (which resolves dynamic routing-block
+     * + routing.mjs imports) to settle before asserting on hook output. We
+     * piggyback on before_tool_call which awaits initPromise internally.
+     */
+    async function flushInit(mock: Awaited<ReturnType<typeof createTestPlugin>>) {
+      const before = mock.lifecycle.find((l) => l.event === "before_tool_call");
+      if (before) {
+        try { await before.handler({ toolName: "noop", params: {} }); } catch { /* ignore */ }
+      }
+    }
+
     it("returns appendSystemContext with routing instructions", async () => {
       const mock = await createTestPlugin(join(tempDir, "prompt-build"));
+      await flushInit(mock);
       const promptHook = mock.lifecycle.find(
         (l) => l.event === "before_prompt_build" && l.opts?.priority === 5,
       );
@@ -422,12 +567,175 @@ describe("OpenClawPlugin", () => {
       expect(result.appendSystemContext).toContain("context-mode");
     });
 
+    it("injects skill-like guidance derived from skills/context-mode/SKILL.md", async () => {
+      const mock = await createTestPlugin(join(tempDir, "prompt-skill-like"));
+      await flushInit(mock);
+      const promptHook = mock.lifecycle.find(
+        (l) => l.event === "before_prompt_build" && l.opts?.priority === 5,
+      );
+      const result = promptHook!.handler() as { appendSystemContext?: string };
+      expect(result?.appendSystemContext).toContain("<context_mode_skill_like_guidance");
+      expect(result?.appendSystemContext).toContain("Default to context-mode for ALL commands.");
+    });
+
     it("has priority 5", async () => {
       const mock = await createTestPlugin(join(tempDir, "prompt-priority"));
       const promptHook = mock.lifecycle.find(
         (l) => l.event === "before_prompt_build" && l.opts?.priority === 5,
       );
       expect(promptHook?.opts?.priority).toBe(5);
+    });
+
+    // SLICE OClaw-2: dynamic routing block via createRoutingBlock(toolNamer).
+    it("appendSystemContext is the dynamic <context_window_protection> XML, not stale AGENTS.md disk content", async () => {
+      const mock = await createTestPlugin(join(tempDir, "prompt-dynamic"));
+      await flushInit(mock);
+      const promptHook = mock.lifecycle.find(
+        (l) => l.event === "before_prompt_build" && l.opts?.priority === 5,
+      );
+      const result = promptHook!.handler() as { appendSystemContext?: string };
+      expect(result?.appendSystemContext).toBeDefined();
+      // Hallmark of createRoutingBlock(toolNamer) — see hooks/routing-block.mjs:19.
+      expect(result.appendSystemContext).toContain("<context_window_protection>");
+      expect(result.appendSystemContext).toContain("<tool_selection_hierarchy>");
+      // OpenClaw tool-namer leaves bare ctx_* names unprefixed (no MCP wrap).
+      expect(result.appendSystemContext).toContain("ctx_batch_execute");
+    });
+  });
+
+  // ── SLICE OClaw-1: registerTool exposes 11 ctx_* MCP tools ────────
+  describe("registerTool (SLICE OClaw-1 — sidecar MCP)", () => {
+    const EXPECTED_NAMES = [
+      "ctx_execute",
+      "ctx_execute_file",
+      "ctx_index",
+      "ctx_search",
+      "ctx_fetch_and_index",
+      "ctx_batch_execute",
+      "ctx_stats",
+      "ctx_doctor",
+      "ctx_upgrade",
+      "ctx_purge",
+      "ctx_insight",
+    ] as const;
+
+    it("registers all 11 ctx_* tools via api.registerTool", async () => {
+      const mock = await createTestPlugin(join(tempDir, "register-tool"));
+      const names = mock.tools.map((t) => t.name);
+      for (const expected of EXPECTED_NAMES) {
+        expect(names).toContain(expected);
+      }
+      expect(mock.tools.length).toBeGreaterThanOrEqual(EXPECTED_NAMES.length);
+    });
+
+    it("each tool definition has description + parameters schema", async () => {
+      const mock = await createTestPlugin(join(tempDir, "register-tool-shape"));
+      for (const tool of mock.tools) {
+        expect(tool.description.length).toBeGreaterThan(0);
+        expect(tool.parameters.type).toBe("object");
+        expect(typeof tool.execute).toBe("function");
+      }
+    });
+
+    it("execute() returns MCP-shaped { content: [{type, text}] } response", async () => {
+      const mock = await createTestPlugin(join(tempDir, "register-tool-exec"));
+      const tool = mock.tools.find((t) => t.name === "ctx_search");
+      expect(tool).toBeDefined();
+      const out = await tool!.execute("call-1", { queries: ["hello"] });
+      expect(out).toHaveProperty("content");
+      expect(Array.isArray(out.content)).toBe(true);
+      expect(out.content[0].type).toBe("text");
+      expect(typeof out.content[0].text).toBe("string");
+    });
+  });
+
+  // ── SLICE OClaw-3: before_model_resolve filters system reminders ────
+  describe("before_model_resolve system-reminder filter (SLICE OClaw-3)", () => {
+    it("does NOT insert events when message starts with <system-reminder>", async () => {
+      const mock = await createTestPlugin(join(tempDir, "filter-system-reminder"));
+      const hook = mock.lifecycle.find((l) => l.event === "before_model_resolve");
+      expect(hook).toBeDefined();
+      // Handler is side-effect-only — assert it returns void/undefined and
+      // does not throw on a system-reminder-prefixed message.
+      const result = await hook!.handler({
+        userMessage: "<system-reminder>do not commit</system-reminder> please refactor",
+      });
+      expect(result).toBeUndefined();
+    });
+
+    it("does NOT insert events for <task-notification>, <context_guidance>, <tool-result>", async () => {
+      const mock = await createTestPlugin(join(tempDir, "filter-other-prefixes"));
+      const hook = mock.lifecycle.find((l) => l.event === "before_model_resolve");
+      const prefixes = ["<task-notification>", "<context_guidance>", "<tool-result>"];
+      for (const p of prefixes) {
+        const result = await hook!.handler({ userMessage: `${p}payload` });
+        expect(result).toBeUndefined();
+      }
+    });
+
+    it("STILL processes genuine user messages (no prefix)", async () => {
+      const mock = await createTestPlugin(join(tempDir, "filter-passthrough"));
+      const hook = mock.lifecycle.find((l) => l.event === "before_model_resolve");
+      // Should not throw — extractUserEvents path runs.
+      await expect(
+        hook!.handler({ userMessage: "don't use that approach, use X instead" }),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  // ── SLICE OClaw-4: session_end handler ────────────────────────────
+  describe("session_end (SLICE OClaw-4)", () => {
+    it("registers session_end lifecycle hook", async () => {
+      const mock = await createTestPlugin(join(tempDir, "session-end-register"));
+      const events = mock.lifecycle.map((l) => l.event);
+      expect(events).toContain("session_end");
+    });
+
+    it("session_end handler runs without throwing when no events captured", async () => {
+      const mock = await createTestPlugin(join(tempDir, "session-end-empty"));
+      const hook = mock.lifecycle.find((l) => l.event === "session_end");
+      expect(hook).toBeDefined();
+      await expect(Promise.resolve(hook!.handler({}))).resolves.toBeUndefined();
+    });
+  });
+
+  // ── SLICE OClaw-5: subagent_spawning injects routing block ────────
+  describe("subagent_spawning routing-block injection (SLICE OClaw-5)", () => {
+    async function flushInit(mock: Awaited<ReturnType<typeof createTestPlugin>>) {
+      const before = mock.lifecycle.find((l) => l.event === "before_tool_call");
+      if (before) {
+        try { await before.handler({ toolName: "noop", params: {} }); } catch { /* ignore */ }
+      }
+    }
+
+    it("registers subagent_spawning lifecycle hook", async () => {
+      const mock = await createTestPlugin(join(tempDir, "subagent-register"));
+      const events = mock.lifecycle.map((l) => l.event);
+      expect(events).toContain("subagent_spawning");
+    });
+
+    it("returns inputOverride.prompt with routing block appended to the original prompt", async () => {
+      const mock = await createTestPlugin(join(tempDir, "subagent-inject"));
+      await flushInit(mock);
+      const hook = mock.lifecycle.find((l) => l.event === "subagent_spawning");
+      const out = hook!.handler({
+        input: { prompt: "Investigate the failing test." },
+      }) as { inputOverride?: { prompt?: string } } | undefined;
+      expect(out?.inputOverride?.prompt).toBeDefined();
+      expect(out!.inputOverride!.prompt!).toContain("Investigate the failing test.");
+      expect(out!.inputOverride!.prompt!).toContain("<context_window_protection>");
+      expect(out!.inputOverride!.prompt!).toContain("<context_mode_skill_like_guidance");
+    });
+
+    it("falls back gracefully when input.prompt is missing", async () => {
+      const mock = await createTestPlugin(join(tempDir, "subagent-no-prompt"));
+      await flushInit(mock);
+      const hook = mock.lifecycle.find((l) => l.event === "subagent_spawning");
+      const out = hook!.handler({ input: {} }) as
+        | { inputOverride?: { prompt?: string } }
+        | undefined;
+      expect(out?.inputOverride?.prompt).toContain("<context_window_protection>");
+      expect(out?.inputOverride?.prompt).toContain("<context_mode_skill_like_guidance");
     });
   });
 
@@ -602,6 +910,104 @@ describe("OpenClawPlugin", () => {
       expect(params.command).toContain("context-mode");
     });
   });
+
+  // ═══════════════════════════════════════════════════════════
+  // Issue #645 follow-up — OpenClaw plugin SessionDB path must
+  // match the MCP server's canonical resolver. The pre-fix code
+  // computed a raw `sha256(projectDir).slice(0, 16)` directly,
+  // which misses case-folding on darwin/win32 and the worktree
+  // suffix. `resolveSessionDbPath` handles both. Without this,
+  // any OpenClaw user whose projectDir contains an uppercase
+  // character (typical on macOS — `/Users/Foo/Projects/Bar`)
+  // sees `ctx_stats` and `ctx_search(sort: "timeline")` silently
+  // degrade because the MCP server reads the case-folded
+  // canonical hash while the plugin writes to the raw hash.
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Issue #645 follow-up: SessionDB path matches MCP server's canonical resolver", () => {
+    it("writes SessionDB to resolveSessionDbPath({projectDir, sessionsDir}), not raw sha256(projectDir).slice(0,16)", async () => {
+      // Pick a mixed-case project dir so the canonical (case-folded)
+      // hash diverges from the raw hash on darwin/win32. On Linux
+      // the two coincide by design (case-sensitive FS) so the
+      // assertion still passes — it just stops catching the bug.
+      // On macOS `/var/...` is a symlink to `/private/var/...`, and
+      // `process.chdir()` followed by `process.cwd()` returns the
+      // realpath. The plugin reads `process.cwd()` for projectDir, so
+      // we must hash the realpath form too (otherwise the canonical
+      // hash we compute below diverges from the one the plugin used).
+      const { realpathSync } = await import("node:fs");
+      const mixedCaseProject = realpathSync(
+        mkdtempSync(join(tmpdir(), "OpenClaw-Mixed-")),
+      );
+      const prevCwd = process.cwd();
+      const priorOverride = process.env.CONTEXT_MODE_DATA_DIR;
+      // Route the OpenClaw sessions dir into a fresh scratch root so
+      // we never collide with the developer's real ~/.openclaw DB.
+      const dataRoot = mkdtempSync(join(tmpdir(), "openclaw-645-root-"));
+      process.env.CONTEXT_MODE_DATA_DIR = dataRoot;
+      try {
+        // OpenClaw plugin resolves projectDir via process.cwd() at
+        // register() time (src/adapters/openclaw/plugin.ts:250).
+        process.chdir(mixedCaseProject);
+        vi.resetModules();
+        const { default: plugin } = await import(
+          "../../src/adapters/openclaw/plugin.js"
+        );
+        const mock = createMockApiFull();
+        plugin.register(mock.api);
+
+        // Compute the canonical hash INLINE (do NOT call
+        // resolveSessionDbPath here — that helper performs a one-shot
+        // legacy→canonical rename when only the legacy file exists,
+        // which would silently migrate the pre-fix raw-hash DB into a
+        // canonical-hash file and make this test a tautology that
+        // always passes. We need to observe what's actually on disk
+        // before any migration runs.
+        const { hashProjectDirCanonical } = await import(
+          "../../src/session/db.js"
+        );
+        const sessionsDir = join(
+          dataRoot,
+          "context-mode",
+          "sessions",
+        );
+        const canonicalHash = hashProjectDirCanonical(mixedCaseProject);
+        const canonicalPath = join(sessionsDir, `${canonicalHash}.db`);
+
+        const { existsSync: fileExists } = await import("node:fs");
+        expect(fileExists(canonicalPath)).toBe(true);
+
+        // The pre-fix raw-sha256 literal must NOT be created. On
+        // darwin/win32 the raw hash diverges from the canonical
+        // (case-folded) hash for any mixedCaseProject. On Linux they
+        // coincide — the assertion becomes a self-check that still
+        // passes correctly via the canonical branch.
+        const { createHash } = await import("node:crypto");
+        const rawHash = createHash("sha256")
+          .update(mixedCaseProject)
+          .digest("hex")
+          .slice(0, 16);
+        const buggyRawPath = join(sessionsDir, `${rawHash}.db`);
+        if (canonicalPath !== buggyRawPath) {
+          expect(fileExists(buggyRawPath)).toBe(false);
+        }
+
+        // Mock api is registered solely to flush plugin init; we
+        // assert against the on-disk DB file the plugin opened.
+        void mock;
+      } finally {
+        try { process.chdir(prevCwd); } catch { /* best effort */ }
+        try { rmSync(mixedCaseProject, { recursive: true, force: true }); } catch { /* best effort */ }
+        try { rmSync(dataRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+        if (priorOverride === undefined) {
+          delete process.env.CONTEXT_MODE_DATA_DIR;
+        } else {
+          process.env.CONTEXT_MODE_DATA_DIR = priorOverride;
+        }
+        vi.resetModules();
+      }
+    });
+  });
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -612,7 +1018,7 @@ describe("Plugin exports", () => {
   beforeEach(() => { vi.resetModules(); });
 
   test("plugin exports id, name, configSchema, register", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     assert.equal(plugin.id, "context-mode");
     assert.equal(plugin.name, "Context Mode");
     assert.ok(plugin.configSchema);
@@ -624,7 +1030,7 @@ describe("session_start hook", () => {
   beforeEach(() => { vi.resetModules(); });
 
   test("session_start hook is registered", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -634,7 +1040,7 @@ describe("session_start hook", () => {
   });
 
   test("session_start hook is registered with no priority (void hook)", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -645,7 +1051,7 @@ describe("session_start hook", () => {
   });
 
   test("session_start handler resets resumeInjected — verified via before_prompt_build sequence", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -675,7 +1081,7 @@ describe("compaction hooks", () => {
   beforeEach(() => { vi.resetModules(); });
 
   test("before_compaction hook is registered", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -685,7 +1091,7 @@ describe("compaction hooks", () => {
   });
 
   test("after_compaction hook is registered", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -731,7 +1137,7 @@ describe("resume injection (before_prompt_build)", () => {
   beforeEach(() => { vi.resetModules(); });
 
   test("before_prompt_build resume hook is registered at priority 10", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -945,7 +1351,7 @@ describe("before_model_resolve hook", () => {
   beforeEach(() => { vi.resetModules(); });
 
   test("before_model_resolve hook is registered", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -964,7 +1370,7 @@ describe("before_model_resolve hook", () => {
   });
 
   test("before_model_resolve handler runs without throwing on decision message", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -979,7 +1385,7 @@ describe("before_model_resolve hook", () => {
   });
 
   test("before_model_resolve is silent when userMessage is empty", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -1001,7 +1407,7 @@ describe("command lifecycle hooks", () => {
   beforeEach(() => { vi.resetModules(); });
 
   test("command:reset hook is registered", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, hooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -1011,7 +1417,7 @@ describe("command lifecycle hooks", () => {
   });
 
   test("command:stop hook is registered", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, hooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -1021,7 +1427,7 @@ describe("command lifecycle hooks", () => {
   });
 
   test("command:reset handler runs cleanupOldSessions without throwing", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, hooks } = createMockApiHooks();
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -1040,7 +1446,7 @@ describe("verbose logging", () => {
   beforeEach(() => { vi.resetModules(); });
 
   test("plugin works without logger (logger is optional)", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api } = createMockApiHooks(false); // no logger
 
     assert.doesNotThrow(() =>
@@ -1049,7 +1455,7 @@ describe("verbose logging", () => {
   });
 
   test("session_start emits info log when logger is provided", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks, logLines } = createMockApiHooks(true);
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -1063,7 +1469,7 @@ describe("verbose logging", () => {
   });
 
   test("after_tool_call emits debug log for captured events when logger provided", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks, logLines } = createMockApiHooks(true);
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -1082,7 +1488,7 @@ describe("verbose logging", () => {
   });
 
   test("before_prompt_build emits debug log when resume is injected", async () => {
-    const { default: plugin } = await import("../../src/openclaw-plugin.js");
+    const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
     const { api, typedHooks, logLines } = createMockApiHooks(true);
 
     plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
@@ -1167,5 +1573,134 @@ describe("WorkspaceRouter", () => {
     // No workspace derivable — should not crash
     expect(router.resolveSessionId({ command: "cat /openclaw/workspace-trainer/x" }))
       .toBeNull();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════
+// Install-time runtime-config mutation
+// (scripts/lib/register-openclaw-config.mjs, called by
+//  scripts/install-openclaw-plugin.sh step 5)
+// ═══════════════════════════════════════════════════════════
+
+describe("registerContextModeInOpenclawConfig", () => {
+  const { readFileSync } = require("node:fs") as typeof import("node:fs");
+  let tmp: string;
+  let runtimePath: string;
+  const pluginRoot = "/fake/plugin/root";
+  const expectedBundle = `${pluginRoot}/server.bundle.mjs`;
+
+  // Dynamic import avoids a TS `allowJs: false` compile error for the .mjs
+  // helper while still running the real implementation under vitest.
+  let registerContextModeInOpenclawConfig: (
+    runtimePath: string,
+    pluginRoot: string,
+  ) => {
+    pluginsAllow: string[];
+    mcpServer: { command: string; args: string[] };
+    messages: string[];
+  };
+
+  beforeAll(async () => {
+    ({ registerContextModeInOpenclawConfig } = (await import(
+      "../../scripts/lib/register-openclaw-config.mjs"
+    )) as {
+      registerContextModeInOpenclawConfig: typeof registerContextModeInOpenclawConfig;
+    });
+  });
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "openclaw-install-cfg-"));
+    runtimePath = join(tmp, "openclaw.json");
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("registers mcp.servers.context-mode with an absolute server.bundle.mjs path", () => {
+    writeFileSync(runtimePath, "{}");
+    registerContextModeInOpenclawConfig(runtimePath, pluginRoot);
+    const cfg = JSON.parse(readFileSync(runtimePath, "utf8"));
+    expect(cfg.mcp?.servers?.["context-mode"]).toEqual({
+      command: "node",
+      args: [expectedBundle],
+    });
+  });
+
+  it("is idempotent — re-running against an already-configured file is a no-op", () => {
+    writeFileSync(runtimePath, "{}");
+    registerContextModeInOpenclawConfig(runtimePath, pluginRoot);
+    const first = readFileSync(runtimePath, "utf8");
+    registerContextModeInOpenclawConfig(runtimePath, pluginRoot);
+    const second = readFileSync(runtimePath, "utf8");
+    expect(second).toEqual(first);
+  });
+
+  it("updates a stale MCP server path when pluginRoot changes", () => {
+    writeFileSync(
+      runtimePath,
+      JSON.stringify({
+        mcp: {
+          servers: {
+            "context-mode": { command: "node", args: ["/old/path/server.bundle.mjs"] },
+          },
+        },
+      }),
+    );
+    registerContextModeInOpenclawConfig(runtimePath, "/new/path");
+    const cfg = JSON.parse(readFileSync(runtimePath, "utf8"));
+    expect(cfg.mcp.servers["context-mode"].args[0]).toEqual(
+      "/new/path/server.bundle.mjs",
+    );
+  });
+
+  it("keeps the existing plugins.allow / plugins.entries contract", () => {
+    writeFileSync(runtimePath, "{}");
+    registerContextModeInOpenclawConfig(runtimePath, pluginRoot);
+    const cfg = JSON.parse(readFileSync(runtimePath, "utf8"));
+    expect(cfg.plugins.allow).toContain("context-mode");
+    expect(cfg.plugins.entries["context-mode"]).toEqual({ enabled: true });
+  });
+
+  it("removes the legacy plugins.load.paths entry when present", () => {
+    writeFileSync(
+      runtimePath,
+      JSON.stringify({ plugins: { load: { paths: [pluginRoot, "/other/plugin"] } } }),
+    );
+    registerContextModeInOpenclawConfig(runtimePath, pluginRoot);
+    const cfg = JSON.parse(readFileSync(runtimePath, "utf8"));
+    expect(cfg.plugins.load?.paths ?? []).not.toContain(pluginRoot);
+  });
+
+  it("preserves unrelated fields on the existing mcp.servers entry when refreshing the path", () => {
+    writeFileSync(
+      runtimePath,
+      JSON.stringify({
+        mcp: {
+          servers: {
+            "context-mode": {
+              command: "node",
+              args: ["/old/path/server.bundle.mjs"],
+              env: { CTX_LOG_LEVEL: "debug" },
+              cwd: "/opt/custom",
+              timeout: 45000,
+            },
+          },
+        },
+      }),
+    );
+    registerContextModeInOpenclawConfig(runtimePath, "/new/path");
+    const entry = JSON.parse(readFileSync(runtimePath, "utf8")).mcp.servers["context-mode"];
+    expect(entry.args[0]).toEqual("/new/path/server.bundle.mjs");
+    expect(entry.env).toEqual({ CTX_LOG_LEVEL: "debug" });
+    expect(entry.cwd).toEqual("/opt/custom");
+    expect(entry.timeout).toEqual(45000);
+  });
+
+  it("throws a useful error when the runtime config is not valid JSON", () => {
+    writeFileSync(runtimePath, "{ this is not json");
+    expect(() => registerContextModeInOpenclawConfig(runtimePath, pluginRoot)).toThrow(
+      /Failed to parse.*valid JSON/,
+    );
   });
 });

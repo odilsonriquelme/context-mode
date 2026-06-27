@@ -23,9 +23,31 @@ export const HOOK_SCRIPTS: Partial<Record<HookType, string>> = {
   [HOOK_TYPES.POST_TOOL_USE]: "posttooluse.mjs",
   [HOOK_TYPES.SESSION_START]: "sessionstart.mjs",
   [HOOK_TYPES.STOP]: "stop.mjs",
+  [HOOK_TYPES.AFTER_AGENT_RESPONSE]: "afteragentresponse.mjs",
 };
 
+/**
+ * Negative-lookahead matcher for external MCP tool namespaces on Cursor (#529).
+ *
+ * Cursor MCP wire shape: `MCP:<tool>` (verified in
+ * tests/fixtures/cursor/pretooluse-mcp.json, hooks/cursor/posttooluse.mjs:19-25).
+ * Context-mode's own tools surface as `MCP:ctx_<...>`. The negative lookahead
+ * on the `ctx_` prefix fires for every other MCP tool whose payload would
+ * otherwise flood the model's context window before PostToolUse can act.
+ *
+ * Routing.mjs `isExternalMcpTool` is extended to recognise the `MCP:` prefix
+ * so the routing branch returns external-MCP guidance instead of passthrough.
+ */
+export const EXTERNAL_MCP_MATCHER_PATTERN = "MCP:(?!ctx_)";
+
 /** Canonical Cursor-native matchers for tools context-mode routes proactively. */
+// NOTE (Cursor-3, deferred): Cursor is closed-source and does not currently
+// publish the exact tool name it uses for sub-agent dispatch (the analogue of
+// Claude Code's "Task" tool). The "Task" matcher below is kept as a best-guess
+// placeholder until probe data from a real Cursor session confirms the wire
+// name. If/when that probe lands, replace or supplement this entry — do NOT
+// add unverified matchers in the meantime. See Phase 7 audit
+// `/tmp/v1.0.107-adapter-cursor.json` (Cursor-3) for the full deferral note.
 export const PRE_TOOL_USE_MATCHERS = [
   "Shell",
   "Read",
@@ -37,6 +59,7 @@ export const PRE_TOOL_USE_MATCHERS = [
   "MCP:ctx_execute",
   "MCP:ctx_execute_file",
   "MCP:ctx_batch_execute",
+  EXTERNAL_MCP_MATCHER_PATTERN,
 ] as const;
 
 export const PRE_TOOL_USE_MATCHER_PATTERN = PRE_TOOL_USE_MATCHERS.join("|");

@@ -3,6 +3,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
 
+import { getActiveFakeHome } from "./util/isolated-env-state.js";
+
 // Import this helper only from suites that exercise homedir()-backed session state.
 // We keep fake HOME opt-in per suite instead of global in vitest.config.ts so
 // unrelated tests still run against their normal environment and do not inherit
@@ -16,7 +18,19 @@ process.env.USERPROFILE = fakeHome;
 process.env.HOMEDRIVE = root.replace(/[\\/]+$/, "");
 process.env.HOMEPATH = fakeHome.slice(root.length) || root;
 
+// Prevent CONTEXT_MODE_BRIDGE_DEPTH from leaking in when Pi's MCP child
+// spawned with depth=1 and that env persisted into the test runner.
+delete process.env.CONTEXT_MODE_BRIDGE_DEPTH;
+
+// `node:os` mock: defer to `withIsolatedEnv()` when a scoped fake HOME is
+// active; otherwise return the suite-wide fakeHome. This lets tests opt into
+// stricter Windows-aware isolation without forking the mock setup.
 vi.mock("node:os", async () => {
   const mod = await vi.importActual<typeof import("node:os")>("node:os");
-  return { ...mod, homedir: () => fakeHome };
+  const realTmp = mod.tmpdir();
+  return {
+    ...mod,
+    homedir: () => getActiveFakeHome() ?? fakeHome,
+    tmpdir: () => getActiveFakeHome() ?? realTmp,
+  };
 });

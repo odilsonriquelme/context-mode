@@ -20,7 +20,7 @@ context-mode uses a flat `src/` structure:
 src/
   server.ts        → MCP server, tool handlers, auto-indexing
   store.ts         → FTS5 content store (index, search, chunking)
-  executor.ts      → Polyglot code executor (11 languages)
+  executor.ts      → Polyglot code executor (12 languages)
   security.ts      → Permission enforcement (deny/allow rules)
   runtime.ts       → Runtime detection (Node, Bun, Python, etc.)
   db-base.ts       → SQLite base class (shared by store + session)
@@ -35,10 +35,12 @@ src/
     types.ts       → HookAdapter interface, RoutingInstructionsConfig
     detect.ts      → Platform detection via env vars
     claude-code/   → Claude Code adapter (index.ts, hooks.ts, config.ts)
+    qwen-code/     → Qwen Code adapter (extends Claude Code wire protocol)
     gemini-cli/    → Gemini CLI adapter
     opencode/      → OpenCode adapter
     codex/         → Codex CLI adapter
     vscode-copilot/ → VS Code Copilot adapter
+    omp/           → OMP (Oh My Pi) adapter — MCP-only, isolated ~/.omp/ storage (#473)
   openclaw/
     workspace-router.ts → Workspace path resolution for Pi Agent sessions
   openclaw-plugin.ts   → OpenClaw gateway plugin entry (sync register)
@@ -76,7 +78,11 @@ MCP server        → detects markdown file on next getStore() call
 LLM               → searches source:"session-events" for details on demand
 ```
 
-Raw session events are **never injected into context**. Only a compact summary table + search queries are injected. The LLM searches for details via the existing `search()` MCP tool.
+Raw session events are **never injected into context**. Only a compact summary table + search queries are injected. The LLM searches for details via the existing `ctx_search()` MCP tool.
+
+### Multi-writer contract (v1.0.130 — see [docs/adr/0001-sessiondb-multi-writer.md](docs/adr/0001-sessiondb-multi-writer.md))
+
+Both SessionDB and ContentStore are **multi-writer-safe**. Two processes may open the same on-disk dbPath simultaneously — that is the legitimate multi-window UX shape. Write contention is handled by `withRetry()` on top of SQLite's built-in `busy_timeout` (30000ms). Do NOT add `acquireDbLock`-style file locks or `locking_mode = EXCLUSIVE` pragmas to `SQLiteBase` or `applyWALPragmas`. Process-identity invariants (one MCP per project) live in `src/util/sibling-mcp.ts`, not the DB layer.
 
 ## Prerequisites
 
@@ -133,7 +139,7 @@ The symlink in step 2 ensures `hooks.json` (which registers PostToolUse, PreComp
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Read|Grep|WebFetch|Agent|Task|mcp__plugin_context-mode_context-mode__ctx_execute|mcp__plugin_context-mode_context-mode__ctx_execute_file|mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+        "matcher": "Bash|Read|Grep|WebFetch|Agent|mcp__plugin_context-mode_context-mode__ctx_execute|mcp__plugin_context-mode_context-mode__ctx_execute_file|mcp__plugin_context-mode_context-mode__ctx_batch_execute|mcp__(?!plugin_context-mode_)",
         "hooks": [
           {
             "type": "command",
@@ -257,10 +263,12 @@ After rebuilding, restart your Claude Code session. The MCP server reloads on se
 
 We follow test-driven development. Every PR must include tests.
 
-**We strongly recommend installing the context-mode-ops skill** — it includes TDD enforcement, issue triage, PR review, and release automation with parallel subagent orchestration:
+**We strongly recommend installing the context-mode-ops skill** — it includes TDD enforcement, issue triage, PR review, and release automation with parallel subagent orchestration.
+
+The skill lives under `.claude/skills/context-mode-ops/` in this repo (moved from the deprecated `skills/` location in #439). Install via the direct path:
 
 ```bash
-npx skills add mksglu/context-mode --skill context-mode-ops
+npx skills add https://github.com/mksglu/context-mode/tree/main/.claude/skills/context-mode-ops
 ```
 
 ### Red-Green-Refactor
@@ -287,7 +295,10 @@ npx skills add mksglu/context-mode --skill context-mode-ops
 | Cursor hooks | `tests/hooks/cursor-hooks.test.ts` |
 | Gemini hooks | `tests/hooks/gemini-hooks.test.ts` |
 | VS Code hooks | `tests/hooks/vscode-hooks.test.ts` |
+| JetBrains hooks | `tests/hooks/jetbrains-hooks.test.ts` |
 | Kiro hooks | `tests/hooks/kiro-hooks.test.ts` |
+| Copilot CLI hooks | `tests/hooks/copilot-cli-hooks.test.ts` |
+| Antigravity CLI hooks | `tests/hooks/antigravity-cli-hooks.test.ts` |
 | Session DB | `tests/session/session-db.test.ts` |
 | Session extract | `tests/session/session-extract.test.ts` |
 | Session snapshot | `tests/session/session-snapshot.test.ts` |
@@ -302,7 +313,7 @@ If your change doesn't fit any existing file, discuss with the maintainer before
 
 ### Output quality matters
 
-When your change affects tool output (execute, search, fetch_and_index, etc.), always compare before and after:
+When your change affects tool output (ctx_execute, ctx_search, ctx_fetch_and_index, etc.), always compare before and after:
 
 1. Run the same prompt **before** your change (on `main`)
 2. Run it **again** with your change
@@ -336,6 +347,44 @@ To test against a running OpenClaw gateway:
 
 See [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md) for hook registration details and known upstream issues.
 
+## Prose-style policy (issue [#482](https://github.com/mksglu/context-mode/issues/482))
+
+context-mode does not dictate how the model writes its final answer. The four pillars (sandbox routing, session continuity, think-in-code, no prose-style enforcement) keep raw data out of context but leave editorial style — brevity vs. completeness, formatting, tone — entirely to the model and the user's own `CLAUDE.md` / `AGENTS.md`.
+
+**Why:** aggressive brevity instructions have been shown to degrade coding/reasoning benchmarks. Moonshot AI's report on `kimi-k2.5` (cited in [#482](https://github.com/mksglu/context-mode/issues/482), with the OpenCode fix at [anomalyco/opencode#20259](https://github.com/anomalyco/opencode/pull/20259)) showed that prompts like "minimize output tokens", "MUST answer concisely with fewer than 4 lines", and "one-word answers are best" pushed coding models to drop assumptions, caveats, verification evidence, failure modes, and security warnings the user actually needed.
+
+**What this means for contributors:**
+
+- Do **not** add brevity directives to MCP tool descriptions in `src/server.ts`.
+- Do **not** add `<communication_style>` or `<response_format>` blocks to `hooks/routing-block.mjs`.
+- Do **not** put "Terse like caveman" / "Only fluff die" / "Drop articles, filler" / "fewer than N lines" wording in any shipped adapter config under `configs/*/`.
+- Workflow-discipline rules — "write artifacts to FILES", "use descriptive `ctx_search` source labels", `<artifact_policy>` — are fine. They describe *what to do* (file vs. inline), not *how to write*.
+
+The regression test at `tests/core/server.test.ts > prose-style policy (#482)` pins the deletion: any caveman-style language landing in `src/server.ts`, `hooks/routing-block.mjs`, or `README.md` will fail CI.
+
+If you genuinely need to nudge the model on style for a specific use case, do it in your own project's `CLAUDE.md` / `AGENTS.md`. Don't ship it inside the framework.
+
+## For Pi developers
+
+context-mode works on Pi now. The extension injects routing rules, registers
+ctx_* tools through the MCP bridge, and the lean `configs/pi/AGENTS.md` keeps
+context budget tight.
+
+**First-time setup:** If you open this project in Pi before running `npm install`
+and `npm run build`, you will see errors. That's normal — the extension needs
+the compiled server bundle. Run the build once and restart.
+
+- If you use Pi: remove `CLAUDE.md` from your project root. Pi.dev reads both
+  CLAUDE.md and AGENTS.md, burning double context on duplicated routing
+  instructions the extension already injects.
+- Use `ctx_search` to recall decisions, errors, and blockers from prior
+  sessions instead of re-reading raw files.
+- Use `ctx_insight` for personal analytics — session activity, tool usage,
+  error rate, project focus.
+
+For the full local dev workflow, build commands, and test instructions, see
+[the contributing guide above](#contributing-to-context-mode).
+
 ## Submitting a Bug Report
 
 When filing a bug, **always include your prompt**. The exact message you sent to the agent is critical for reproduction. Without it, we can't debug the issue.
@@ -349,7 +398,7 @@ Required information:
 ## Submitting a Pull Request
 
 1. Fork the repository
-2. Create a feature branch from `main`
+2. Create a feature branch from `next`
 3. Follow the local development setup above
 4. Write tests first (TDD)
 5. Run `npm test` and `npm run typecheck`

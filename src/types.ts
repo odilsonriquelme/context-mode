@@ -36,6 +36,14 @@ export interface SessionEvent {
   data: string;
   priority: number;
   data_hash: string;
+  /**
+   * Best-effort project attribution for this event.
+   * Empty string means unattributed/unknown.
+   */
+  project_dir?: string;
+  attribution_source?: string;
+  /** 0..1 confidence score for project attribution. */
+  attribution_confidence?: number;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -84,6 +92,14 @@ export interface SearchResult {
   contentType: "code" | "prose";
   matchLayer?: "porter" | "trigram" | "fuzzy" | "rrf" | "rrf-fuzzy";
   highlighted?: string;
+  timestamp?: string;
+  /**
+   * Session-id attribution copied from the `chunks.session_id` column
+   * (legacy unattributed chunks carry an empty string). Used by the
+   * `ctx_search` per-project filter (#737) to scope shared-DB results
+   * to the current project via the 2-step IN-clause strategy.
+   */
+  sessionId?: string;
 }
 
 /**

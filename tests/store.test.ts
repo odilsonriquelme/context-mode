@@ -11,8 +11,15 @@ import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { ContentStore, cleanupStaleDBs } from "../src/store.js";
-import { withRetry } from "../src/db-base.js";
+import {
+  withRetry,
+  closeDB,
+  loadDatabase,
+  applyWALPragmas,
+  nodeSqliteHasFts5,
+} from "../src/db-base.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixtureDir = join(__dirname, "fixtures");
@@ -40,6 +47,140 @@ describe("Schema & Lifecycle", () => {
     store.close();
     // second close should not throw
     assert.doesNotThrow(() => store.close());
+  });
+
+  test("Fresh DB creates new FTS5 schema with 8 columns", () => {
+    const dbPath = join(
+      tmpdir(),
+      `context-mode-test-fresh-${Date.now()}-${Math.random().toString(36).slice(2)}.db`,
+    );
+    const store = new ContentStore(dbPath);
+
+    // Verify the schema by opening the raw DB and checking columns
+    const Database = loadDatabase();
+    const db = new Database(dbPath, { readonly: true });
+    const cols = db.prepare("SELECT name FROM pragma_table_xinfo('chunks')").all() as Array<{ name: string }>;
+    const colNames = cols.map(c => c.name);
+
+    // FTS5 tables should have 8 user columns + 2 hidden (table-name, rank) = 10 total
+    // pragma_table_xinfo includes hidden FTS5 internal columns
+    expect(colNames).toContain("title");
+    expect(colNames).toContain("content");
+    expect(colNames).toContain("source_id");
+    expect(colNames).toContain("content_type");
+    expect(colNames).toContain("source_category");
+    expect(colNames).toContain("session_id");
+    expect(colNames).toContain("event_id");
+    expect(colNames).toContain("timestamp");
+    // 8 user-defined + 2 hidden FTS5 internal (chunks, rank)
+    expect(colNames.length).toBe(10);
+
+    // Same check for trigram table
+    const trigramCols = db.prepare("SELECT name FROM pragma_table_xinfo('chunks_trigram')").all() as Array<{ name: string }>;
+    const trigramColNames = trigramCols.map(c => c.name);
+    expect(trigramColNames).toContain("source_category");
+    expect(trigramColNames).toContain("session_id");
+    expect(trigramColNames).toContain("event_id");
+    expect(trigramColNames).toContain("timestamp");
+    expect(trigramColNames.length).toBe(10);
+
+    db.close();
+    store.close();
+
+    // Cleanup
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try { unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+    }
+  });
+
+  test("Old schema detected and migrated to new schema", () => {
+    const dbPath = join(
+      tmpdir(),
+      `context-mode-test-migrate-${Date.now()}-${Math.random().toString(36).slice(2)}.db`,
+    );
+
+    // Step 1: Create a DB with the OLD schema (4-column FTS5)
+    const Database = loadDatabase();
+    const rawDb = new Database(dbPath);
+    applyWALPragmas(rawDb);
+    rawDb.exec(`
+      CREATE TABLE IF NOT EXISTS sources (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT NOT NULL,
+        chunk_count INTEGER NOT NULL DEFAULT 0,
+        code_chunk_count INTEGER NOT NULL DEFAULT 0,
+        indexed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        file_path TEXT,
+        content_hash TEXT
+      );
+      CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+        title,
+        content,
+        source_id UNINDEXED,
+        content_type UNINDEXED,
+        tokenize='porter unicode61'
+      );
+      CREATE VIRTUAL TABLE IF NOT EXISTS chunks_trigram USING fts5(
+        title,
+        content,
+        source_id UNINDEXED,
+        content_type UNINDEXED,
+        tokenize='trigram'
+      );
+      CREATE TABLE IF NOT EXISTS vocabulary (
+        word TEXT PRIMARY KEY
+      );
+      CREATE INDEX IF NOT EXISTS idx_sources_label ON sources(label);
+    `);
+
+    // Insert a row into old schema to confirm data is present
+    rawDb.exec("INSERT INTO sources (label, chunk_count, code_chunk_count) VALUES ('old-source', 1, 0)");
+    rawDb.exec("INSERT INTO chunks (title, content, source_id, content_type) VALUES ('old title', 'old content', 1, 'prose')");
+    rawDb.exec("INSERT INTO chunks_trigram (title, content, source_id, content_type) VALUES ('old title', 'old content', 1, 'prose')");
+
+    // Verify old schema has only 4 user columns (+ 2 hidden FTS5 = 6 total)
+    const oldCols = rawDb.prepare("SELECT name FROM pragma_table_xinfo('chunks')").all() as Array<{ name: string }>;
+    expect(oldCols.length).toBe(6);
+    expect(oldCols.map(c => c.name)).not.toContain("source_category");
+
+    rawDb.close();
+
+    // Step 2: Open with ContentStore — migration should trigger
+    const store = new ContentStore(dbPath);
+
+    // Step 3: Verify migration happened — new columns exist
+    const checkDb = new Database(dbPath, { readonly: true });
+    const newCols = checkDb.prepare("SELECT name FROM pragma_table_xinfo('chunks')").all() as Array<{ name: string }>;
+    const newColNames = newCols.map(c => c.name);
+    expect(newColNames).toContain("source_category");
+    expect(newColNames).toContain("session_id");
+    expect(newColNames).toContain("event_id");
+    expect(newColNames).toContain("timestamp");
+    expect(newColNames.length).toBe(10);
+
+    const newTrigramCols = checkDb.prepare("SELECT name FROM pragma_table_xinfo('chunks_trigram')").all() as Array<{ name: string }>;
+    expect(newTrigramCols.map(c => c.name)).toContain("source_category");
+    expect(newTrigramCols.length).toBe(10);
+
+    // Old chunk data is gone (DROP + re-CREATE clears data)
+    const chunkCount = checkDb.prepare("SELECT COUNT(*) as cnt FROM chunks").get() as { cnt: number };
+    expect(chunkCount.cnt).toBe(0);
+
+    // Sources table still intact (not dropped)
+    const sourceCount = checkDb.prepare("SELECT COUNT(*) as cnt FROM sources").get() as { cnt: number };
+    expect(sourceCount.cnt).toBe(1);
+
+    // Store still functional — can index new content
+    const result = store.index({ content: "# Test\n\nNew content after migration.", source: "post-migration" });
+    expect(result.totalChunks).toBeGreaterThan(0);
+
+    checkDb.close();
+    store.close();
+
+    // Cleanup
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try { unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+    }
   });
 });
 
@@ -104,6 +245,23 @@ describe("Basic Indexing", () => {
     store.close();
   });
 
+  test("index reads file when content is empty string and path is provided (regression #350)", () => {
+    // Some MCP clients send `content: ""` together with `path`. The previous
+    // implementation used `content ?? readFileSync(path)` which kept the empty
+    // string and indexed 0 chunks. Empty content + a valid path must fall
+    // back to reading the file.
+    const store = createStore();
+    const result = store.index({
+      content: "",
+      path: join(fixtureDir, "context7-react-docs.md"),
+      source: "Context7: empty-content path repro",
+    });
+    assert.ok(result.totalChunks > 0, "Should chunk the fixture from path even when content is empty string");
+    assert.ok(result.codeChunks > 0, "React docs have code blocks");
+    assert.equal(result.label, "Context7: empty-content path repro");
+    store.close();
+  });
+
   test("stats update after indexing", () => {
     const store = createStore();
     store.index({
@@ -114,6 +272,59 @@ describe("Basic Indexing", () => {
     assert.ok(stats.sources >= 1);
     assert.ok(stats.chunks >= 1);
     store.close();
+  });
+
+  test("attribution flows through to chunks.session_id and chunks.event_id (#FK)", () => {
+    // SLICE 1: index*() must accept an optional `attribution` so chunks rows
+    // carry the session/event that triggered them. Hardcoded "" defeats the
+    // FK to session_events that powers per-session honest-savings stats.
+    const dbPath = join(
+      tmpdir(),
+      `context-mode-attrfk-${Date.now()}-${Math.random().toString(36).slice(2)}.db`,
+    );
+    const store = new ContentStore(dbPath);
+    store.index({
+      content: "# Hello\n\nAttribution test body.",
+      source: "attr-doc",
+      attribution: { sessionId: "sess-FK-1", eventId: "evt-FK-9" },
+    } as Parameters<typeof store.index>[0]);
+
+    store.indexPlainText(
+      "log line one\nlog line two\nlog line three",
+      "attr-plain",
+      20,
+      { sessionId: "sess-FK-2", eventId: "evt-FK-10" },
+    );
+
+    store.indexJSON(
+      JSON.stringify({ a: 1, b: { c: "x" } }),
+      "attr-json",
+      undefined,
+      { sessionId: "sess-FK-3", eventId: "evt-FK-11" },
+    );
+
+    // Read raw rows back through a fresh handle to confirm persisted columns.
+    store.close();
+    const Database = loadDatabase();
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const rows = db
+        .prepare(
+          "SELECT title, source_id, session_id, event_id FROM chunks WHERE session_id != '' ORDER BY rowid",
+        )
+        .all() as Array<{ title: string; session_id: string; event_id: string }>;
+      const sessions = rows.map((r) => r.session_id);
+      const events = rows.map((r) => r.event_id);
+      assert.ok(rows.length >= 3, `expected attributed chunks across 3 indexers, got ${rows.length}`);
+      assert.ok(sessions.includes("sess-FK-1"), "index() must persist sessionId");
+      assert.ok(sessions.includes("sess-FK-2"), "indexPlainText() must persist sessionId");
+      assert.ok(sessions.includes("sess-FK-3"), "indexJSON() must persist sessionId");
+      assert.ok(events.includes("evt-FK-9"), "index() must persist eventId");
+      assert.ok(events.includes("evt-FK-10"), "indexPlainText() must persist eventId");
+      assert.ok(events.includes("evt-FK-11"), "indexJSON() must persist eventId");
+    } finally {
+      closeDB(db);
+    }
   });
 });
 
@@ -615,6 +826,89 @@ describe("Source-Scoped Search", () => {
     assert.ok(
       results.every((r) => r.source.includes("v22")),
       "Should only return v22 source",
+    );
+    store.close();
+  });
+
+  // Regression: #646 — LIKE wildcards in user-supplied source labels must not leak.
+  // SQLite LIKE treats `_` as "any single char" and `%` as "any sequence". Sources
+  // that naturally contain these (URL-encoded paths, versioned API endpoints,
+  // underscored filenames) silently turned into wildcards and pulled in chunks
+  // from unrelated sources. Fix escapes `_`, `%`, and `\` with ESCAPE '\'.
+  test("source filter does not leak via `_` wildcard in source label (#646)", () => {
+    const store = createStore();
+    store.index({ content: "# A\n\nfoo bar baz qux content matter", source: "api_v1" });
+    store.index({ content: "# B\n\nfoo bar baz qux different content matter", source: "apiXv1" });
+    store.index({ content: "# C\n\nfoo bar baz qux another content matter", source: "api-v1" });
+    store.index({ content: "# D\n\nfoo bar baz qux unrelated matter", source: "completely-other" });
+
+    // BM25 (porter) path
+    const porter = store.search("foo bar baz qux matter", 10, "api_v1");
+    assert.ok(porter.length > 0, "Should match the literal source");
+    assert.ok(
+      porter.every((r) => r.source === "api_v1"),
+      `Underscore must be literal, not LIKE wildcard. Got: ${porter.map((r) => r.source).join(", ")}`,
+    );
+
+    // Trigram path — same scoping contract
+    const trigram = store.searchTrigram("foo bar baz qux matter", 10, "api_v1", "OR");
+    assert.ok(
+      trigram.every((r) => r.source === "api_v1"),
+      `Trigram path must also escape underscore. Got: ${trigram.map((r) => r.source).join(", ")}`,
+    );
+
+    // Fallback (RRF + fuzzy) path
+    const fallback = store.searchWithFallback("foo bar baz qux matter", 10, "api_v1");
+    assert.ok(
+      fallback.every((r) => r.source === "api_v1"),
+      `Fallback path must also escape underscore. Got: ${fallback.map((r) => r.source).join(", ")}`,
+    );
+
+    store.close();
+  });
+
+  test("source filter does not leak via `%` wildcard in source label (#646)", () => {
+    const store = createStore();
+    store.index({ content: "# E\n\nhello world content matter", source: "100%off" });
+    store.index({ content: "# F\n\nhello world stuff matter", source: "100ANYTHINGoff" });
+    store.index({ content: "# G\n\nhello world other matter", source: "unrelated-source" });
+
+    const results = store.search("hello world matter", 10, "100%off");
+    assert.ok(results.length > 0, "Should match literal `100%off`");
+    assert.ok(
+      results.every((r) => r.source === "100%off"),
+      `Percent must be literal, not LIKE wildcard. Got: ${results.map((r) => r.source).join(", ")}`,
+    );
+    store.close();
+  });
+
+  test("source filter still treats partial substring as substring after escaping (#646)", () => {
+    // Confirms the escape fix did not regress legitimate substring matching
+    // for sources without LIKE metacharacters.
+    const store = createStore();
+    store.index({ content: "# H\n\nConfig database.", source: "Node.js v22 CHANGELOG" });
+    store.index({ content: "# I\n\nApp config.", source: "Zod API docs" });
+
+    const results = store.search("config", 5, "v22");
+    assert.ok(results.length > 0, "Plain partial match must still work after escape fix");
+    assert.ok(
+      results.every((r) => r.source.includes("v22")),
+      `Plain substring still works. Got: ${results.map((r) => r.source).join(", ")}`,
+    );
+    store.close();
+  });
+
+  test("source filter handles backslash literal in source label (#646)", () => {
+    // Backslash is the ESCAPE character — must itself be escaped to remain literal.
+    const store = createStore();
+    store.index({ content: "# J\n\nbackslash content matter", source: "path\\to\\thing" });
+    store.index({ content: "# K\n\nbackslash other matter", source: "pathXtoXthing" });
+
+    const results = store.search("backslash matter", 10, "path\\to\\thing");
+    assert.ok(results.length > 0, "Should match the literal backslash source");
+    assert.ok(
+      results.every((r) => r.source === "path\\to\\thing"),
+      `Backslash must be literal. Got: ${results.map((r) => r.source).join(", ")}`,
     );
     store.close();
   });
@@ -1280,5 +1574,541 @@ describe("SQLITE_BUSY retry logic", () => {
       }, [0, 0, 0]);
     }).toThrow("UNIQUE constraint failed");
     expect(attempts).toBe(1);
+  });
+});
+
+// ── withRetry coverage for all write/read paths ──
+
+describe("withRetry edge cases", () => {
+  test("withRetry succeeds on first attempt", () => {
+    const result = withRetry(() => "immediate", [0, 0, 0]);
+    expect(result).toBe("immediate");
+  });
+
+  test("withRetry recovers on last retry", () => {
+    let attempts = 0;
+    const result = withRetry(() => {
+      attempts++;
+      if (attempts <= 3) {
+        throw new Error("SQLITE_BUSY: database is locked");
+      }
+      return "recovered";
+    }, [0, 0, 0]);
+    expect(result).toBe("recovered");
+    expect(attempts).toBe(4); // 1 initial + 3 retries
+  });
+
+  test("withRetry handles 'database is locked' without SQLITE_BUSY prefix", () => {
+    let attempts = 0;
+    const result = withRetry(() => {
+      attempts++;
+      if (attempts < 2) {
+        throw new Error("database is locked");
+      }
+      return "ok";
+    }, [0, 0, 0]);
+    expect(result).toBe("ok");
+    expect(attempts).toBe(2);
+  });
+
+  test("withRetry with empty delays array throws immediately on BUSY", () => {
+    expect(() => {
+      withRetry(() => {
+        throw new Error("SQLITE_BUSY: database is locked");
+      }, []);
+    }).toThrow(/SQLITE_BUSY.*0 retries/);
+  });
+
+  test("withRetry preserves return type", () => {
+    const obj = withRetry(() => ({ key: "value", num: 42 }), [0]);
+    expect(obj).toEqual({ key: "value", num: 42 });
+  });
+});
+
+// ── Concurrent write resilience ──
+
+describe("concurrent DB access", () => {
+  test("two ContentStore instances can write to the same DB file", () => {
+    const dbPath = join(tmpdir(), `concurrent-write-${Date.now()}.db`);
+    const store1 = new ContentStore(dbPath);
+    const store2 = new ContentStore(dbPath);
+
+    store1.index({ content: "# First\n\nContent from store 1.", source: "store1-doc" });
+    store2.index({ content: "# Second\n\nContent from store 2.", source: "store2-doc" });
+
+    // Both sources should be searchable from either store
+    const results1 = store1.search("Content from store", 10);
+    expect(results1.length).toBeGreaterThanOrEqual(2);
+
+    const results2 = store2.search("Content from store", 10);
+    expect(results2.length).toBeGreaterThanOrEqual(2);
+
+    store1.cleanup();
+    store2.close();
+  });
+
+  test("indexPlainText is protected by withRetry", () => {
+    // Verify indexPlainText doesn't throw on transient BUSY by testing
+    // concurrent plain text indexing on same DB
+    const dbPath = join(tmpdir(), `concurrent-plaintext-${Date.now()}.db`);
+    const store1 = new ContentStore(dbPath);
+    const store2 = new ContentStore(dbPath);
+
+    store1.indexPlainText("alpha bravo charlie", "plain-1");
+    store2.indexPlainText("delta echo foxtrot", "plain-2");
+
+    const r1 = store1.search("alpha bravo", 5, "plain-1");
+    expect(r1.length).toBeGreaterThan(0);
+    const r2 = store1.search("delta echo", 5, "plain-2");
+    expect(r2.length).toBeGreaterThan(0);
+
+    store1.cleanup();
+    store2.close();
+  });
+
+  test("indexJSON is protected by withRetry", () => {
+    const dbPath = join(tmpdir(), `concurrent-json-${Date.now()}.db`);
+    const store1 = new ContentStore(dbPath);
+    const store2 = new ContentStore(dbPath);
+
+    store1.indexJSON(JSON.stringify({ users: [{ name: "Alice" }] }), "json-1");
+    store2.indexJSON(JSON.stringify({ items: [{ id: 1 }] }), "json-2");
+
+    const results = store1.search("Alice", 5);
+    expect(results.length).toBeGreaterThan(0);
+
+    store1.cleanup();
+    store2.close();
+  });
+
+  test("search and searchTrigram work under concurrent writes", () => {
+    const dbPath = join(tmpdir(), `concurrent-search-${Date.now()}.db`);
+    const store1 = new ContentStore(dbPath);
+    const store2 = new ContentStore(dbPath);
+
+    store1.index({ content: "# Guide\n\nReact hooks are powerful.", source: "guide" });
+
+    // Write from store2 while store1 searches
+    store2.index({ content: "# Tutorial\n\nVue composition API.", source: "tutorial" });
+    const results = store1.search("hooks", 5);
+    expect(results.length).toBeGreaterThan(0);
+
+    store1.cleanup();
+    store2.close();
+  });
+});
+
+// ── WAL checkpoint on close (#244) ──
+
+describe("closeDB — WAL checkpoint", () => {
+  test("closeDB checkpoints WAL so no -wal file remains", () => {
+    const dbPath = join(tmpdir(), `wal-test-${Date.now()}.db`);
+    const Database = loadDatabase();
+    const db = Database(dbPath, { timeout: 30000 });
+    applyWALPragmas(db);
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+    db.exec("INSERT INTO t VALUES (1, 'hello')");
+
+    // WAL file should exist after writes in WAL mode
+    expect(existsSync(dbPath + "-wal")).toBe(true);
+
+    closeDB(db);
+
+    // After closeDB, WAL should be checkpointed (truncated to 0 or removed)
+    // The file may still exist but should be empty, or may not exist
+    const walExists = existsSync(dbPath + "-wal");
+    if (walExists) {
+      const walSize = readFileSync(dbPath + "-wal").length;
+      expect(walSize).toBe(0);
+    }
+
+    // cleanup
+    for (const s of ["", "-wal", "-shm"]) {
+      try { unlinkSync(dbPath + s); } catch {}
+    }
+  });
+});
+
+// ── Corrupt DB recovery (#244) ──
+
+describe("ContentStore — corrupt DB recovery", () => {
+  // Windows file locking prevents WAL/SHM deletion while another worker holds them open
+  test.skipIf(process.platform === "win32")("recovers from corrupt DB file by deleting and recreating", () => {
+    const dbPath = join(tmpdir(), `corrupt-store-${Date.now()}.db`);
+    // Write garbage to simulate corrupt DB
+    writeFileSync(dbPath, "THIS IS NOT A SQLITE DATABASE FILE");
+    writeFileSync(dbPath + "-wal", "CORRUPT WAL");
+
+    // Should recover: delete corrupt files and create fresh DB
+    const store = new ContentStore(dbPath);
+    // Store should be functional
+    store.index({ content: "test content", source: "test" });
+    const results = store.search("test content");
+    expect(results.length).toBeGreaterThan(0);
+
+    store.cleanup();
+  });
+
+  test("non-SQLite errors still throw", () => {
+    // A path to a directory (not a file) should throw a non-corruption error
+    expect(() => new ContentStore(tmpdir())).toThrow();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════
+// mmap_size pragma
+// ═══════════════════════════════════════════════════════════
+
+describe("mmap_size pragma", () => {
+  test("mmap_size is set on new ContentStore", () => {
+    const dbPath = join(tmpdir(), `ctx-mmap-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const store = new ContentStore(dbPath);
+    store.indexPlainText("Memory-mapped I/O test content for FTS5 search", "mmap-test");
+    const results = store.search("memory-mapped");
+    expect(results.length).toBeGreaterThan(0);
+    store.cleanup();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════
+// FTS5 Periodic Optimization
+// ═══════════════════════════════════════════════════════════
+
+describe("FTS5 periodic optimize", () => {
+  test("search works correctly after OPTIMIZE_EVERY inserts", () => {
+    const dbPath = join(tmpdir(), `ctx-optimize-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const store = new ContentStore(dbPath);
+
+    for (let i = 0; i < ContentStore.OPTIMIZE_EVERY + 5; i++) {
+      store.indexPlainText(`Document number ${i} about testing optimization`, `source-${i}`);
+    }
+
+    const results = store.search("testing optimization");
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].content).toContain("testing optimization");
+
+    store.cleanup();
+  });
+
+  test("close() does not throw even after many inserts", () => {
+    const dbPath = join(tmpdir(), `ctx-optimize-close-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const store = new ContentStore(dbPath);
+
+    for (let i = 0; i < 10; i++) {
+      store.indexPlainText(`Content ${i}`, `src-${i}`);
+    }
+
+    expect(() => store.close()).not.toThrow();
+  });
+
+  test("OPTIMIZE_EVERY is a reasonable value", () => {
+    expect(ContentStore.OPTIMIZE_EVERY).toBeGreaterThanOrEqual(20);
+    expect(ContentStore.OPTIMIZE_EVERY).toBeLessThanOrEqual(200);
+  });
+});
+
+describe("Sanitize query token deduplication", () => {
+  test("sanitizeQuery removes duplicate tokens (case-insensitive)", async () => {
+    const { sanitizeQuery } = await import("../src/store.js");
+    assert.equal(
+      sanitizeQuery("error error error"),
+      '"error"',
+      "three identical tokens should compile to a single quoted term",
+    );
+    assert.equal(
+      sanitizeQuery("Error ERROR error"),
+      '"Error"',
+      "case differences should not create duplicate tokens",
+    );
+  });
+
+  test("sanitizeQuery preserves first-occurrence casing after dedup", async () => {
+    const { sanitizeQuery } = await import("../src/store.js");
+    assert.equal(sanitizeQuery("Database database DATABASE"), '"Database"');
+  });
+
+  test("sanitizeQuery preserves distinct tokens and their order", async () => {
+    const { sanitizeQuery } = await import("../src/store.js");
+    // "update" is a stopword, but the meaningful terms remain distinct.
+    assert.equal(
+      sanitizeQuery("database query database index query"),
+      '"database" "query" "index"',
+      "distinct tokens should be kept; duplicates collapsed in first-seen order",
+    );
+  });
+
+  test("sanitizeTrigramQuery removes duplicate tokens", async () => {
+    const { sanitizeTrigramQuery } = await import("../src/store.js");
+    assert.equal(
+      sanitizeTrigramQuery("error error error"),
+      '"error"',
+    );
+    assert.equal(
+      sanitizeTrigramQuery("error ERROR Error"),
+      '"error"',
+      "case-insensitive dedup across all three trigram sanitize paths",
+    );
+  });
+
+  test("dedup in OR mode collapses duplicates but preserves distinct terms", async () => {
+    const { sanitizeQuery } = await import("../src/store.js");
+    assert.equal(
+      sanitizeQuery("error error database", "OR"),
+      '"error" OR "database"',
+    );
+  });
+
+  test("search returns identical results for duplicated and deduplicated queries", () => {
+    const store = createStore();
+    store.index({
+      content:
+        "# Error Handling\n\nThe database connection threw an error during migration.\n\n# Overview\n\nPlain content.",
+      source: "dedup-behavioral",
+    });
+
+    const duplicated = store.search("error error error database database");
+    const unique = store.search("error database");
+
+    assert.equal(duplicated.length, unique.length);
+    for (let i = 0; i < duplicated.length; i++) {
+      assert.equal(duplicated[i].title, unique[i].title);
+      assert.equal(duplicated[i].content, unique[i].content);
+    }
+    store.close();
+  });
+});
+
+describe("Stopword filtering in search queries", () => {
+  test("stopwords are filtered from search — meaningful terms drive ranking", () => {
+    const store = createStore();
+    // "fix" and "update" are stopwords in the domain list.
+    // "database" and "connection" are meaningful terms.
+    store.index({
+      content:
+        "# Database Connection Pool\n\nManage database connections with pooling.\n\n# Update Log\n\nFix applied to update module on Tuesday.",
+      source: "stopword-search",
+    });
+
+    // Search with stopwords mixed in — results should prioritize "database connection"
+    const results = store.search("fix database connection", 2);
+    assert.ok(results.length > 0, "Should return results");
+    assert.ok(
+      results[0].content.toLowerCase().includes("database") &&
+        results[0].content.toLowerCase().includes("connection"),
+      `Top result should match meaningful terms 'database connection', got: ${results[0].title}`,
+    );
+    store.close();
+  });
+
+  test("all-stopword query still returns results (fallback)", () => {
+    const store = createStore();
+    store.index({
+      content: "# Updates\n\nUpdate the test runner to fix the issue.\n\n# Other\n\nUnrelated content.",
+      source: "all-stopwords",
+    });
+
+    // "update test fix" are all stopwords — should fall back to using them
+    const results = store.search("update test fix", 2);
+    assert.ok(results.length > 0, "All-stopword query should still return results via fallback");
+    store.close();
+  });
+
+  test("stopwords filtered from trigram search", () => {
+    const store = createStore();
+    store.index({
+      content:
+        "# Encryption Module\n\nAES encryption with key rotation.\n\n# Testing Guide\n\nRun tests using the test framework.",
+      source: "trigram-stopwords",
+    });
+
+    // "using" is a stopword, "encryption" is meaningful
+    const results = store.searchTrigram("using encryption", 2);
+    assert.ok(results.length > 0, "Should return results");
+    assert.ok(
+      results[0].content.toLowerCase().includes("encryption"),
+      `Should match on meaningful term 'encryption', got: ${results[0].title}`,
+    );
+    store.close();
+  });
+
+  test("proximity reranking ignores stopwords for boost calculation", () => {
+    const store = createStore();
+    // Two chunks: one has "database error" close together, the other has them far apart
+    // but has "fix" (stopword) nearby
+    store.index({
+      content:
+        "# Error Handling\n\nThe database threw an error during migration.\n\n# Fix Log\n\nWe fix things. Much later in this document we mention database. Even later we see error.",
+      source: "proximity-stopwords",
+    });
+
+    const results = store.searchWithFallback("fix database error", 2);
+    assert.ok(results.length > 0, "Should return results");
+    // The chunk with "database" and "error" close together should rank higher
+    // because "fix" (stopword) is excluded from proximity calculation
+    assert.ok(
+      results[0].content.toLowerCase().includes("database") &&
+        results[0].content.toLowerCase().includes("error") &&
+        results[0].title.includes("Error"),
+      `Proximity should favor chunk with meaningful terms close together, got: ${results[0].title}`,
+    );
+    store.close();
+  });
+});
+
+// ─────────────────────────────────────────────────────────
+// nodeSqliteHasFts5 — issue #461
+// On Linux + Node >= 22.5, the picker used to commit to node:sqlite as
+// soon as the import succeeded, even on Node builds whose bundled SQLite
+// is compiled without FTS5. ctx_search/ctx_batch_execute then failed with
+// "no such module: fts5". The picker now probes FTS5 support before
+// adopting node:sqlite, falling through to better-sqlite3 otherwise.
+// ─────────────────────────────────────────────────────────
+describe("nodeSqliteHasFts5 — FTS5 capability probe (#461)", () => {
+  test("returns true when CREATE VIRTUAL TABLE … USING fts5 succeeds", () => {
+    let opened = 0;
+    let closed = 0;
+    class FakeDB {
+      constructor(path: string) {
+        assert.equal(path, ":memory:", "probe must use :memory:");
+        opened++;
+      }
+      exec(sql: string): void {
+        assert.match(sql, /CREATE VIRTUAL TABLE .* USING fts5/i);
+      }
+      close(): void { closed++; }
+    }
+    assert.equal(nodeSqliteHasFts5(FakeDB as any), true);
+    assert.equal(opened, 1);
+    assert.equal(closed, 1);
+  });
+
+  test("returns false when FTS5 module is missing on the bundled SQLite", () => {
+    // Reproduces the exact symptom reported in #461 against Node v22.14.0:
+    //   db.exec("CREATE VIRTUAL TABLE t USING fts5(x)") → "no such module: fts5"
+    let closed = 0;
+    class FakeDB {
+      exec(_sql: string): void {
+        throw new Error("no such module: fts5");
+      }
+      close(): void { closed++; }
+    }
+    assert.equal(nodeSqliteHasFts5(FakeDB as any), false);
+    assert.equal(closed, 1, "probe DB must be closed even when FTS5 check throws");
+  });
+
+  test("returns false when DatabaseSync constructor itself throws", () => {
+    class FakeDB {
+      constructor() { throw new Error("DatabaseSync ctor failure"); }
+      exec(_sql: string): void {}
+      close(): void {}
+    }
+    // Probe must not crash the picker — it just reports "no FTS5".
+    assert.equal(nodeSqliteHasFts5(FakeDB as any), false);
+  });
+
+  test("close() failure does not propagate out of the probe", () => {
+    class FakeDB {
+      exec(_sql: string): void {}
+      close(): void { throw new Error("close failed"); }
+    }
+    // Probe should still report success — the FTS5 check passed before close().
+    assert.equal(nodeSqliteHasFts5(FakeDB as any), true);
+  });
+
+  test("real node:sqlite probe matches FTS5 availability on this runtime", () => {
+    // Sanity check: if node:sqlite is loadable, the probe answer must agree
+    // with a direct FTS5 attempt on a fresh DatabaseSync. Skipped when
+    // node:sqlite is unavailable (older Node, non-Linux without flag).
+    let DatabaseSync: any;
+    try {
+      const requireFn = createRequire(import.meta.url);
+      ({ DatabaseSync } = requireFn(["node", "sqlite"].join(":")));
+    } catch {
+      return;
+    }
+    let directOK = false;
+    let direct: any = null;
+    try {
+      direct = new DatabaseSync(":memory:");
+      direct.exec("CREATE VIRTUAL TABLE __direct_probe USING fts5(x)");
+      directOK = true;
+    } catch {
+      directOK = false;
+    } finally {
+      try { direct?.close(); } catch { /* ignore */ }
+    }
+    assert.equal(nodeSqliteHasFts5(DatabaseSync), directOK);
+  });
+});
+
+describe("ctx_index TOCTOU symlink swap (#442 round-3)", () => {
+  test("index() rejects non-regular files (e.g. /dev/null) via fd-bound fstat", () => {
+    // RED proof: prior to the fix, `readFileSync('/dev/null', 'utf-8')`
+    // returned "" so the index call silently produced 0 chunks instead
+    // of rejecting. After the fix, openSync + fstat + isFile() check
+    // throws because /dev/null is a character device, not a regular
+    // file. This invariant closes the swap-mid-flight window: any
+    // post-gate path swap to a non-regular target fails fstat.
+    if (process.platform === "win32") return; // /dev/null differs on win32
+    const charDev = "/dev/null";
+    const store = createStore();
+    try {
+      assert.throws(
+        () => store.index({ path: charDev, source: "chardev" }),
+        /not a regular file/,
+        "non-regular files must be rejected by fd-bound fstat",
+      );
+    } finally {
+      store.close();
+    }
+  });
+
+  test("index() rejects non-regular files via fd-bound fstat (directory)", () => {
+    // If the path is swapped to a directory between gate and read,
+    // fstat on the opened fd reveals it and the read is rejected.
+    const dirPath = join(
+      tmpdir(),
+      `ctx-toctou-dir-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    const requireFn = createRequire(import.meta.url);
+    const fsSync = requireFn("node:fs");
+    fsSync.mkdirSync(dirPath);
+
+    try {
+      const store = createStore();
+      assert.throws(
+        () => store.index({ path: dirPath, source: "dir" }),
+        /not a regular file|EISDIR/,
+        "directory must not be readable through index()",
+      );
+      store.close();
+    } finally {
+      try { fsSync.rmdirSync(dirPath); } catch { /* ignore */ }
+    }
+  });
+
+  test("index() reads file content via fd (regression: normal indexing still works)", () => {
+    // After fd-bound read fix, normal file indexing must still produce
+    // the same chunks/content as before. Validates the GREEN path.
+    const requireFn = createRequire(import.meta.url);
+    const fsSync = requireFn("node:fs");
+    const safePath = join(
+      tmpdir(),
+      `ctx-toctou-safe-${Date.now()}-${Math.random().toString(36).slice(2)}.md`,
+    );
+    fsSync.writeFileSync(
+      safePath,
+      "# Safe Doc\n\nfd-bound read should produce normal chunks.\n",
+    );
+
+    try {
+      const store = createStore();
+      const result = store.index({ path: safePath, source: "safe-fd" });
+      assert.ok(result.totalChunks > 0, "fd-bound read indexed content");
+      assert.equal(result.label, "safe-fd");
+      store.close();
+    } finally {
+      try { fsSync.unlinkSync(safePath); } catch { /* ignore */ }
+    }
   });
 });

@@ -19,24 +19,26 @@
  *   - Session dir: ~/.gemini/context-mode/sessions/
  */
 
-import { createHash } from "node:crypto";
 import {
   readFileSync,
   writeFileSync,
   mkdirSync,
-  copyFileSync,
   accessSync,
   chmodSync,
+  existsSync,
   constants,
 } from "node:fs";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
+
+import { BaseAdapter } from "../base.js";
 
 import type {
   HookAdapter,
   HookParadigm,
   PlatformCapabilities,
   DiagnosticResult,
+  HealthCheck,
   PreToolUseEvent,
   PostToolUseEvent,
   PreCompactEvent,
@@ -59,6 +61,7 @@ interface GeminiCLIHookInput {
   is_error?: boolean;
   session_id?: string;
   source?: string;
+  cwd?: string;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -69,6 +72,7 @@ import {
   HOOK_TYPES as GEMINI_HOOK_NAMES,
   HOOK_SCRIPTS as GEMINI_HOOK_SCRIPTS,
   buildHookCommand as buildGeminiHookCommand,
+  EXTERNAL_MCP_MATCHER_PATTERN,
   type HookType as GeminiHookType,
 } from "./hooks.js";
 
@@ -76,7 +80,11 @@ import {
 // Adapter implementation
 // ─────────────────────────────────────────────────────────
 
-export class GeminiCLIAdapter implements HookAdapter {
+export class GeminiCLIAdapter extends BaseAdapter implements HookAdapter {
+  constructor() {
+    super([".gemini"]);
+  }
+
   readonly name = "Gemini CLI";
   readonly paradigm: HookParadigm = "json-stdio";
 
@@ -98,7 +106,7 @@ export class GeminiCLIAdapter implements HookAdapter {
       toolName: input.tool_name ?? "",
       toolInput: input.tool_input ?? {},
       sessionId: this.extractSessionId(input),
-      projectDir: this.getProjectDir(),
+      projectDir: this.getProjectDir(input),
       raw,
     };
   }
@@ -111,7 +119,7 @@ export class GeminiCLIAdapter implements HookAdapter {
       toolOutput: input.tool_output,
       isError: input.is_error,
       sessionId: this.extractSessionId(input),
-      projectDir: this.getProjectDir(),
+      projectDir: this.getProjectDir(input),
       raw,
     };
   }
@@ -120,7 +128,7 @@ export class GeminiCLIAdapter implements HookAdapter {
     const input = raw as GeminiCLIHookInput;
     return {
       sessionId: this.extractSessionId(input),
-      projectDir: this.getProjectDir(),
+      projectDir: this.getProjectDir(input),
       raw,
     };
   }
@@ -147,7 +155,7 @@ export class GeminiCLIAdapter implements HookAdapter {
     return {
       sessionId: this.extractSessionId(input),
       source,
-      projectDir: this.getProjectDir(),
+      projectDir: this.getProjectDir(input),
       raw,
     };
   }
@@ -220,33 +228,28 @@ export class GeminiCLIAdapter implements HookAdapter {
     return resolve(homedir(), ".gemini", "settings.json");
   }
 
-  getSessionDir(): string {
-    const dir = join(homedir(), ".gemini", "context-mode", "sessions");
-    mkdirSync(dir, { recursive: true });
-    return dir;
-  }
-
-  getSessionDBPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}.db`);
-  }
-
-  getSessionEventsPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}-events.md`);
+  getInstructionFiles(): string[] {
+    return ["GEMINI.md"];
   }
 
   generateHookConfig(pluginRoot: string): HookRegistration {
     return {
-      [GEMINI_HOOK_NAMES.BEFORE_TOOL]: [
+      [GEMINI_HOOK_NAMES.BEFORE_AGENT]: [
         {
           matcher: "",
+          hooks: [
+            {
+              type: "command",
+              command: buildGeminiHookCommand(GEMINI_HOOK_NAMES.BEFORE_AGENT, pluginRoot),
+            },
+          ],
+        },
+      ],
+      [GEMINI_HOOK_NAMES.BEFORE_TOOL]: [
+        {
+          // Gemini native tools + context-mode own MCP (both canonical and Claude
+          // shim prefixes) + external MCP catch-all (#529).
+          matcher: `run_shell_command|read_file|read_many_files|grep_search|search_file_content|web_fetch|activate_skill|mcp__plugin_context-mode|mcp__context-mode|${EXTERNAL_MCP_MATCHER_PATTERN}`,
           hooks: [
             {
               type: "command",
@@ -262,6 +265,17 @@ export class GeminiCLIAdapter implements HookAdapter {
             {
               type: "command",
               command: buildGeminiHookCommand(GEMINI_HOOK_NAMES.AFTER_TOOL, pluginRoot),
+            },
+          ],
+        },
+      ],
+      [GEMINI_HOOK_NAMES.AFTER_MODEL]: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "command",
+              command: buildGeminiHookCommand(GEMINI_HOOK_NAMES.AFTER_MODEL, pluginRoot),
             },
           ],
         },
@@ -381,6 +395,45 @@ export class GeminiCLIAdapter implements HookAdapter {
     return results;
   }
 
+  /**
+   * Adapter-defined health checks (Algo-D1) — mirrors claude-code's override
+   * at src/adapters/claude-code/index.ts:275.
+   *
+   * Issue #712 motivation: gemini-cli's hook scripts ship under
+   * `<pluginRoot>/hooks/gemini-cli/<scriptName>` (see HOOK_MAP in
+   * src/cli.ts and `setHookPermissions` in this file). The legacy doctor
+   * path (`getHookScriptPaths` -> `extractHookScriptPath`) round-trips
+   * through `buildHookCommand` -> command-string parsing, so a missing
+   * platform subdir in the emit was invisible to the doctor until a user
+   * installed globally and observed FAIL lines. This override drops the
+   * round-trip: HOOK_SCRIPTS is the single source of truth and we probe
+   * `existsSync(join(pluginRoot, "hooks", "gemini-cli", scriptName))`
+   * directly, so a future regression in the command emit cannot make the
+   * doctor lie about hook health.
+   *
+   * Adding a new hook event in HOOK_SCRIPTS auto-extends doctor coverage
+   * here — no parallel hardcoded list to maintain.
+   */
+  getHealthChecks(pluginRoot: string): readonly HealthCheck[] {
+    return Object.entries(GEMINI_HOOK_SCRIPTS).map(
+      ([hookType, scriptName]) => {
+        const absolutePath = join(pluginRoot, "hooks", "gemini-cli", scriptName);
+        return {
+          name: `Hook script: ${hookType} (${scriptName})`,
+          check: () => {
+            if (existsSync(absolutePath)) {
+              return { status: "OK" as const, detail: absolutePath };
+            }
+            return {
+              status: "FAIL" as const,
+              detail: `not found at ${absolutePath}`,
+            };
+          },
+        };
+      },
+    );
+  }
+
   checkPluginRegistration(): DiagnosticResult {
     const settings = this.readSettings();
     if (!settings) {
@@ -449,6 +502,7 @@ export class GeminiCLIAdapter implements HookAdapter {
     const hookConfigs: Array<{
       name: string;
     }> = [
+      { name: GEMINI_HOOK_NAMES.BEFORE_AGENT },
       { name: GEMINI_HOOK_NAMES.BEFORE_TOOL },
       { name: GEMINI_HOOK_NAMES.SESSION_START },
     ];
@@ -485,18 +539,6 @@ export class GeminiCLIAdapter implements HookAdapter {
     settings.hooks = hooks;
     this.writeSettings(settings);
     return changes;
-  }
-
-  backupSettings(): string | null {
-    const settingsPath = this.getSettingsPath();
-    try {
-      accessSync(settingsPath, constants.R_OK);
-      const backupPath = settingsPath + ".bak";
-      copyFileSync(settingsPath, backupPath);
-      return backupPath;
-    } catch {
-      return null;
-    }
   }
 
   setHookPermissions(pluginRoot: string): string[] {
@@ -538,9 +580,20 @@ export class GeminiCLIAdapter implements HookAdapter {
 
   // ── Internal helpers ───────────────────────────────────
 
-  /** Get the project directory from environment variables. */
-  private getProjectDir(): string | undefined {
-    return process.env.GEMINI_PROJECT_DIR ?? process.env.CLAUDE_PROJECT_DIR;
+  /**
+   * Resolve the project directory for a Gemini CLI hook input.
+   * Priority: input.cwd > GEMINI_PROJECT_DIR > CLAUDE_PROJECT_DIR > process.cwd().
+   * Mirrors the cursor / opencode pattern so downstream hooks always
+   * receive a defined projectDir even when the platform omits cwd
+   * from the wire payload (e.g. under worktrees).
+   */
+  private getProjectDir(input: GeminiCLIHookInput): string {
+    return (
+      input.cwd
+      ?? process.env.GEMINI_PROJECT_DIR
+      ?? process.env.CLAUDE_PROJECT_DIR
+      ?? process.cwd()
+    );
   }
 
   /**

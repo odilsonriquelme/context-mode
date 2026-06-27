@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { OpenClawAdapter } from "../../src/adapters/openclaw/index.js";
+import { hashProjectDirCanonical, resolveSessionDbPath } from "../../src/session/db.js";
 
 describe("OpenClawAdapter", () => {
   let adapter: OpenClawAdapter;
@@ -82,6 +83,33 @@ describe("OpenClawAdapter", () => {
         toolName: "shell",
       });
       expect(event.projectDir).toBe(process.cwd());
+    });
+
+    it("prefers input.cwd over env and process.cwd()", () => {
+      const saved = process.env.OPENCLAW_PROJECT_DIR;
+      process.env.OPENCLAW_PROJECT_DIR = "/env/openclaw";
+      try {
+        const event = adapter.parsePreToolUseInput({
+          toolName: "shell",
+          cwd: "/wire/cwd",
+        } as unknown as Record<string, unknown>);
+        expect(event.projectDir).toBe("/wire/cwd");
+      } finally {
+        if (saved === undefined) delete process.env.OPENCLAW_PROJECT_DIR;
+        else process.env.OPENCLAW_PROJECT_DIR = saved;
+      }
+    });
+
+    it("falls back to OPENCLAW_PROJECT_DIR when input.cwd missing", () => {
+      const saved = process.env.OPENCLAW_PROJECT_DIR;
+      process.env.OPENCLAW_PROJECT_DIR = "/env/openclaw";
+      try {
+        const event = adapter.parsePreToolUseInput({ toolName: "shell" });
+        expect(event.projectDir).toBe("/env/openclaw");
+      } finally {
+        if (saved === undefined) delete process.env.OPENCLAW_PROJECT_DIR;
+        else process.env.OPENCLAW_PROJECT_DIR = saved;
+      }
     });
 
     it("falls back to pid when no sessionId", () => {
@@ -249,7 +277,7 @@ describe("OpenClawAdapter", () => {
     });
 
     it("session DB path includes project hash", () => {
-      const dbPath = adapter.getSessionDBPath("/test/project");
+      const dbPath = resolveSessionDbPath({ projectDir: "/test/project", sessionsDir: adapter.getSessionDir() });
       expect(dbPath).toContain(".openclaw");
       expect(dbPath).toContain("context-mode");
       expect(dbPath).toContain("sessions");
@@ -257,7 +285,7 @@ describe("OpenClawAdapter", () => {
     });
 
     it("session events path includes project hash", () => {
-      const eventsPath = adapter.getSessionEventsPath("/test/project");
+      const eventsPath = join(adapter.getSessionDir(), `${hashProjectDirCanonical("/test/project")}-events.md`);
       expect(eventsPath).toContain(".openclaw");
       expect(eventsPath).toMatch(/-events\.md$/);
     });

@@ -16,25 +16,20 @@
  *   - Session dir: ~/.config/opencode/context-mode/sessions/
  */
 
-import { createHash } from "node:crypto";
-
-/** Strip JSONC comments (// and /* *​/) and trailing commas for JSON.parse. */
-function stripJsonComments(str: string): string {
-  return str
-    .replace(/\/\/.*$/gm, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/,(\s*[}\]])/g, "$1");
-}
 import {
   readFileSync,
   writeFileSync,
   mkdirSync,
   copyFileSync,
   accessSync,
+  existsSync,
   constants,
 } from "node:fs";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
+
+import { BaseAdapter, resolveContextModeDataRoot } from "../base.js";
+import { stripJsonComments } from "../../util/jsonc.js";
 
 import type {
   HookAdapter,
@@ -89,7 +84,7 @@ import { HOOK_TYPES as OPENCODE_HOOK_NAMES } from "./hooks.js";
 
 export type AdapterPlatformType = Extract<PlatformId, "opencode" | "kilo">;
 
-export class OpenCodeAdapter implements HookAdapter {
+export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
   get name(): string {
     return this.platform === "kilo" ? "KiloCode" : "OpenCode";
   }
@@ -100,15 +95,18 @@ export class OpenCodeAdapter implements HookAdapter {
     preToolUse: true,
     postToolUse: true,
     preCompact: true, // experimental
-    sessionStart: false,
+    sessionStart: true,
     canModifyArgs: true,
     canModifyOutput: true, // with TUI bug caveat for bash (#13575)
-    canInjectSessionContext: false,
+    canInjectSessionContext: true,
   };
 
   private platform: AdapterPlatformType;
 
   constructor(platform: AdapterPlatformType = "opencode") {
+    // sessionDirSegments unused — opencode overrides getSessionDir()
+    // with XDG_CONFIG_HOME / APPDATA logic
+    super([".config", platform]);
     this.platform = platform;
   }
 
@@ -224,57 +222,86 @@ export class OpenCodeAdapter implements HookAdapter {
   // ── Configuration ──────────────────────────────────────
 
   getSettingsPath(): string {
-    // OpenCode uses opencode.json in the project root or .opencode/opencode.json
-    return this.settingsPath ?? resolve(`${this.platform}.json`);
+    if (this.settingsPath) return this.settingsPath;
+    // Edge case (#849): writeSettings() called without a prior readSettings()
+    // (which is what populates this.settingsPath). Never create a `.json` that
+    // would shadow an existing `.jsonc` — OpenCode merges the project-root
+    // `.jsonc` LAST, so it is the authoritative config
+    // (refs/platforms/opencode/packages/opencode/src/config/config.ts:406-408
+    // + paths.ts:15-22). Prefer the existing `.jsonc` as the write target.
+    const jsoncPath = resolve(`${this.platform}.jsonc`);
+    if (existsSync(jsoncPath)) return jsoncPath;
+    return resolve(`${this.platform}.json`);
   }
 
   private paths(): string[] {
+    // `.jsonc` is listed BEFORE `.json` so it is selected as the write target
+    // when both exist (#849). OpenCode loads the project-root `.json` then
+    // `.jsonc` and merges `.jsonc` last — scalars override-last, arrays concat
+    // (refs/platforms/opencode/packages/opencode/src/config/config.ts:406-408,
+    // 258-260 + paths.ts:15-22). The `.jsonc` is therefore the authoritative
+    // file holding the user's real config; a `.json` is often an empty/auto-
+    // generated placeholder. Writing into the placeholder would create a
+    // file that shadows the user's real `.jsonc`. Preferring `.jsonc` for the
+    // write target avoids that silent config destruction. Read order is
+    // irrelevant for the plugin early-return (hasContextModePlugin) path.
     if (this.platform === "kilo") {
+      // Kilo runtime accepts `.kilo/`, `.kilocode/`, and `.opencode/` as
+      // project config dirs (refs/platforms/kilo/packages/opencode/src/
+      // kilocode/config/config.ts:50,408). Mirror that here so context-mode
+      // discovers config regardless of which suffix the user adopted.
       return [
-        resolve("kilo.json"),
         resolve("kilo.jsonc"),
-        resolve(".kilo", "kilo.json"),
+        resolve("kilo.json"),
         resolve(".kilo", "kilo.jsonc"),
-        join(homedir(), ".config", "kilo", "kilo.json"),
+        resolve(".kilo", "kilo.json"),
+        resolve(".kilocode", "kilo.jsonc"),
+        resolve(".kilocode", "kilo.json"),
         join(homedir(), ".config", "kilo", "kilo.jsonc"),
-      ];  
+        join(homedir(), ".config", "kilo", "kilo.json"),
+      ];
     }
     return [
-      resolve("opencode.json"),
       resolve("opencode.jsonc"),
-      resolve(".opencode", "opencode.json"),
+      resolve("opencode.json"),
       resolve(".opencode", "opencode.jsonc"),
-      join(homedir(), ".config", "opencode", "opencode.json"),
+      resolve(".opencode", "opencode.json"),
       join(homedir(), ".config", "opencode", "opencode.jsonc"),
+      join(homedir(), ".config", "opencode", "opencode.json"),
     ];
   }
 
   getSessionDir(): string {
-    let configDir: string;
-    if (process.platform === "win32") {
-      configDir = process.env.APPDATA || join(homedir(), "AppData", "Roaming");
-    } else {
-      configDir = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-    }
-    const dir = join(configDir, this.platform, "context-mode", "sessions");
+    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // ahead of OpenCode/Kilo's XDG-rooted default. opencode.json + plugin
+    // discovery stay under getConfigDir() so OpenCode itself sees its own
+    // config in the expected location.
+    const override = resolveContextModeDataRoot();
+    const dir = override
+      ? join(override, "context-mode", "sessions")
+      : join(this.getConfigDir(), "context-mode", "sessions");
     mkdirSync(dir, { recursive: true });
     return dir;
   }
 
-  getSessionDBPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}.db`);
+  /**
+   * OpenCode/KiloCode honor XDG_CONFIG_HOME on POSIX and APPDATA on Windows.
+   * Falls back to ~/.config/<platform> (or %APPDATA%\<platform>).
+   * Always absolute. `_projectDir` is accepted for interface symmetry but
+   * unused — config is home/XDG-rooted, never project-scoped.
+   */
+  getConfigDir(_projectDir?: string): string {
+    let root: string;
+    if (process.platform === "win32") {
+      root = process.env.APPDATA || join(homedir(), "AppData", "Roaming");
+    } else {
+      root = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+    }
+    return join(root, this.platform);
   }
 
-  getSessionEventsPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}-events.md`);
+  getInstructionFiles(): string[] {
+    return ["AGENTS.md"];
   }
 
   generateHookConfig(_pluginRoot: string): HookRegistration {
@@ -401,12 +428,21 @@ export class OpenCodeAdapter implements HookAdapter {
       });
     }
 
-    // Warn about SessionStart limitation
+    if (this.hasLegacyContextModeMcp(settings)) {
+      results.push({
+        check: "Legacy MCP registration",
+        status: "warn",
+        message: "mcp.context-mode is redundant: ctx_* tools are now provided by the plugin",
+        fix: "context-mode upgrade (removes only mcp.context-mode; preserves other MCP servers)",
+      });
+    }
+
+    // Note: SessionStart handled via experimental.chat.system.transform surrogate
     results.push({
       check: "SessionStart hook",
-      status: "warn",
+      status: "pass",
       message:
-        `SessionStart not supported in ${this.name} (see issues #14808, #5409)`,
+        `SessionStart via experimental.chat.system.transform surrogate (native hook pending #14808, #5409)`,
     });
 
     return results;
@@ -473,6 +509,17 @@ export class OpenCodeAdapter implements HookAdapter {
     }
 
     settings.plugin = plugins;
+
+    const mcp = settings.mcp;
+    if (mcp && typeof mcp === "object" && !Array.isArray(mcp)) {
+      const servers = mcp as Record<string, unknown>;
+      if (Object.prototype.hasOwnProperty.call(servers, "context-mode")) {
+        delete servers["context-mode"];
+        changes.push("Removed legacy context-mode MCP block (plugin-native tools)");
+      }
+      if (Object.keys(servers).length === 0) delete settings.mcp;
+    }
+
     this.writeSettings(settings);
     return changes;
   }
@@ -513,6 +560,16 @@ export class OpenCodeAdapter implements HookAdapter {
   private hasContextModePlugin(settings: Record<string, unknown>): boolean {
     const plugins = settings.plugin;
     return Array.isArray(plugins) && plugins.some((p: unknown) => typeof p === "string" && p.includes("context-mode"));
+  }
+
+  private hasLegacyContextModeMcp(settings: Record<string, unknown>): boolean {
+    const mcp = settings.mcp;
+    return !!(
+      mcp &&
+      typeof mcp === "object" &&
+      !Array.isArray(mcp) &&
+      Object.prototype.hasOwnProperty.call(mcp, "context-mode")
+    );
   }
 
   /**

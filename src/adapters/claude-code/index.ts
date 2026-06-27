@@ -1,53 +1,49 @@
 /**
  * adapters/claude-code — Claude Code platform adapter.
  *
- * Implements HookAdapter for Claude Code's JSON stdin/stdout hook paradigm.
+ * Extends ClaudeCodeBaseAdapter (shared wire-protocol parse/format methods)
+ * with Claude Code-specific configuration, diagnostics, and upgrade logic.
  *
  * Claude Code hook specifics:
- *   - I/O: JSON on stdin, JSON on stdout
- *   - Arg modification: `updatedInput` field in response
- *   - Blocking: `permissionDecision: "deny"` in response
- *   - PostToolUse output: `updatedMCPToolOutput` field
- *   - PreCompact: stdout on exit 0
  *   - Session ID: transcript_path UUID > session_id > CLAUDE_SESSION_ID > ppid
- *   - Config: ~/.claude/settings.json
- *   - Session dir: ~/.claude/context-mode/sessions/
+ *   - Config root: $CLAUDE_CONFIG_DIR (when set) or ~/.claude
+ *   - Settings: <configDir>/settings.json
+ *   - Session dir: <configDir>/context-mode/sessions/
+ *   - Plugin registry: <configDir>/plugins/installed_plugins.json
  */
 
-import { createHash } from "node:crypto";
 import {
   readFileSync,
   writeFileSync,
-  mkdirSync,
-  copyFileSync,
-  accessSync,
   existsSync,
   readdirSync,
   chmodSync,
+  accessSync,
+  mkdirSync,
   constants,
 } from "node:fs";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 
-import type {
-  HookAdapter,
-  HookParadigm,
-  PlatformCapabilities,
-  DiagnosticResult,
-  PreToolUseEvent,
-  PostToolUseEvent,
-  PreCompactEvent,
-  SessionStartEvent,
-  PreToolUseResponse,
-  PostToolUseResponse,
-  PreCompactResponse,
-  SessionStartResponse,
-  HookRegistration,
+import { ClaudeCodeBaseAdapter, type ClaudeCodeWireInput } from "../claude-code-base.js";
+import { resolveContextModeDataRoot } from "../base.js";
+import { resolveClaudeConfigDir } from "../../util/claude-config.js";
+import { checkPluginCacheIntegritySync } from "../../util/plugin-cache-integrity.js";
+
+import {
+  buildHookRuntimeCommand,
+  type HookAdapter,
+  type HookParadigm,
+  type PlatformCapabilities,
+  type DiagnosticResult,
+  type HookRegistration,
+  type HealthCheck,
 } from "../types.js";
 import {
   HOOK_TYPES,
   HOOK_SCRIPTS,
   REQUIRED_HOOKS,
+  PRE_TOOL_USE_MATCHERS,
   PRE_TOOL_USE_MATCHER_PATTERN,
   isContextModeHook,
   isAnyContextModeHook,
@@ -57,26 +53,17 @@ import {
 } from "./hooks.js";
 
 // ─────────────────────────────────────────────────────────
-// Claude Code raw input types
-// ─────────────────────────────────────────────────────────
-
-interface ClaudeCodeHookInput {
-  tool_name?: string;
-  tool_input?: Record<string, unknown>;
-  tool_output?: string;
-  is_error?: boolean;
-  session_id?: string;
-  transcript_path?: string;
-  source?: string;
-}
-
-// ─────────────────────────────────────────────────────────
 // Adapter implementation
 // ─────────────────────────────────────────────────────────
 
-export class ClaudeCodeAdapter implements HookAdapter {
+export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapter {
+  constructor() {
+    super([".claude"]);
+  }
+
   readonly name = "Claude Code";
   readonly paradigm: HookParadigm = "json-stdio";
+  protected readonly projectDirEnvVar = "CLAUDE_PROJECT_DIR";
 
   readonly capabilities: PlatformCapabilities = {
     preToolUse: true,
@@ -88,153 +75,64 @@ export class ClaudeCodeAdapter implements HookAdapter {
     canInjectSessionContext: true,
   };
 
-  // ── Input parsing ──────────────────────────────────────
-
-  parsePreToolUseInput(raw: unknown): PreToolUseEvent {
-    const input = raw as ClaudeCodeHookInput;
-    return {
-      toolName: input.tool_name ?? "",
-      toolInput: input.tool_input ?? {},
-      sessionId: this.extractSessionId(input),
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
-      raw,
-    };
-  }
-
-  parsePostToolUseInput(raw: unknown): PostToolUseEvent {
-    const input = raw as ClaudeCodeHookInput;
-    return {
-      toolName: input.tool_name ?? "",
-      toolInput: input.tool_input ?? {},
-      toolOutput: input.tool_output,
-      isError: input.is_error,
-      sessionId: this.extractSessionId(input),
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
-      raw,
-    };
-  }
-
-  parsePreCompactInput(raw: unknown): PreCompactEvent {
-    const input = raw as ClaudeCodeHookInput;
-    return {
-      sessionId: this.extractSessionId(input),
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
-      raw,
-    };
-  }
-
-  parseSessionStartInput(raw: unknown): SessionStartEvent {
-    const input = raw as ClaudeCodeHookInput;
-    const rawSource = input.source ?? "startup";
-
-    let source: SessionStartEvent["source"];
-    switch (rawSource) {
-      case "compact":
-        source = "compact";
-        break;
-      case "resume":
-        source = "resume";
-        break;
-      case "clear":
-        source = "clear";
-        break;
-      default:
-        source = "startup";
-    }
-
-    return {
-      sessionId: this.extractSessionId(input),
-      source,
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
-      raw,
-    };
-  }
-
-  // ── Response formatting ────────────────────────────────
-
-  formatPreToolUseResponse(response: PreToolUseResponse): unknown {
-    if (response.decision === "deny") {
-      return {
-        permissionDecision: "deny",
-        reason: response.reason ?? "Blocked by context-mode hook",
-      };
-    }
-    if (response.decision === "modify" && response.updatedInput) {
-      return { updatedInput: response.updatedInput };
-    }
-    if (response.decision === "context" && response.additionalContext) {
-      // Claude Code: inject additionalContext into model context
-      return { additionalContext: response.additionalContext };
-    }
-    if (response.decision === "ask") {
-      // Claude Code: native "ask" — prompt user for permission
-      return { permissionDecision: "ask" };
-    }
-    // "allow" — return null/undefined for passthrough
-    return undefined;
-  }
-
-  formatPostToolUseResponse(response: PostToolUseResponse): unknown {
-    const result: Record<string, unknown> = {};
-    if (response.additionalContext) {
-      result.additionalContext = response.additionalContext;
-    }
-    if (response.updatedOutput) {
-      result.updatedMCPToolOutput = response.updatedOutput;
-    }
-    return Object.keys(result).length > 0 ? result : undefined;
-  }
-
-  formatPreCompactResponse(response: PreCompactResponse): unknown {
-    // Claude Code: stdout content on exit 0 is injected as context
-    return response.context ?? "";
-  }
-
-  formatSessionStartResponse(response: SessionStartResponse): unknown {
-    // Claude Code: stdout content is injected as additional context
-    return response.context ?? "";
-  }
-
   // ── Configuration ──────────────────────────────────────
 
-  getSettingsPath(): string {
-    return resolve(homedir(), ".claude", "settings.json");
+  /**
+   * Honor `CLAUDE_CONFIG_DIR` (the canonical Claude Code config root) before
+   * falling back to `~/.claude`. Mirrors the contract that
+   * `hooks/session-helpers.mjs::resolveConfigDir` already follows — including
+   * tilde expansion for shells that pass `~/foo` through unchanged — so server
+   * and hooks agree on where session-scoped state lives. See issue #453.
+   *
+   * Tilde regex `/^~[/\\]?/` only handles the current-user form (`~`, `~/`,
+   * `~\`); `~user/` is NOT expanded to a per-user homedir (matches
+   * `resolveConfigDir`). Non-tilde values are run through `resolve()` to
+   * normalize relative paths to absolute against cwd; the hook helper
+   * intentionally leaves them raw, but the adapter contract guarantees an
+   * absolute path (BaseAdapter.getConfigDir docstring).
+   *
+   * Issue #460 round-3: routed through the canonical
+   * `resolveClaudeConfigDir` util so server, CLI, security, and adapter
+   * agree byte-for-byte (incl. empty/whitespace-only env fallback).
+   */
+  getConfigDir(_projectDir?: string): string {
+    return resolveClaudeConfigDir();
   }
 
   getSessionDir(): string {
-    const dir = join(homedir(), ".claude", "context-mode", "sessions");
+    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // before falling back to the Claude-rooted default. The override moves
+    // ONLY context-mode-owned state; settings.json + CLAUDE_CONFIG_DIR stay
+    // intact below.
+    const override = resolveContextModeDataRoot();
+    const dir = override
+      ? join(override, "context-mode", "sessions")
+      : join(this.getConfigDir(), "context-mode", "sessions");
     mkdirSync(dir, { recursive: true });
     return dir;
   }
 
-  getSessionDBPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}.db`);
-  }
-
-  getSessionEventsPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}-events.md`);
+  getSettingsPath(): string {
+    return join(this.getConfigDir(), "settings.json");
   }
 
   generateHookConfig(pluginRoot: string): HookRegistration {
-    const preToolUseCommand = `node ${pluginRoot}/hooks/pretooluse.mjs`;
-    const preToolUseMatchers = [
-      "Bash",
-      "WebFetch",
-      "Read",
-      "Grep",
-      "Task",
-      "mcp__plugin_context-mode_context-mode__ctx_execute",
-      "mcp__plugin_context-mode_context-mode__ctx_execute_file",
-      "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
-    ];
+    // Algo-D3: every command flows through `buildHookRuntimeCommand`
+    // (defined in src/adapters/types.ts), which:
+    //   - quotes both runtime path and scriptPath (#548 — Windows
+    //     pluginRoots with spaces no longer fall through
+    //     extractHookScriptPath's ambiguous-tail fallback),
+    //   - swaps backslashes for forward slashes (#372 MSYS path mangling),
+    //   - resolves the JS runtime via `resolveHookRuntime`: Bun ≥1.0 when
+    //     available, else `process.execPath` (#369 PATH resolution on Git
+    //     Bash, #738 bun cold-start win).
+    // Pre-D3 we hand-rolled `node "${pluginRoot}/hooks/X.mjs"` for all
+    // six events; bare `node` made claude-code the lone outlier and
+    // dropping the execPath swap re-opened the Windows class. Algo-D3.5
+    // (CI invariant in tests/adapters/claude-code.test.ts) locks this in
+    // for adapter #16.
+    const preToolUseCommand = buildHookRuntimeCommand(`${pluginRoot}/hooks/pretooluse.mjs`);
+    const preToolUseMatchers = [...PRE_TOOL_USE_MATCHERS];
 
     return {
       PreToolUse: preToolUseMatchers.map((matcher) => ({
@@ -247,7 +145,7 @@ export class ClaudeCodeAdapter implements HookAdapter {
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/posttooluse.mjs`,
+              command: buildHookRuntimeCommand(`${pluginRoot}/hooks/posttooluse.mjs`),
             },
           ],
         },
@@ -258,7 +156,7 @@ export class ClaudeCodeAdapter implements HookAdapter {
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/precompact.mjs`,
+              command: buildHookRuntimeCommand(`${pluginRoot}/hooks/precompact.mjs`),
             },
           ],
         },
@@ -269,7 +167,7 @@ export class ClaudeCodeAdapter implements HookAdapter {
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/userpromptsubmit.mjs`,
+              command: buildHookRuntimeCommand(`${pluginRoot}/hooks/userpromptsubmit.mjs`),
             },
           ],
         },
@@ -280,7 +178,18 @@ export class ClaudeCodeAdapter implements HookAdapter {
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/sessionstart.mjs`,
+              command: buildHookRuntimeCommand(`${pluginRoot}/hooks/sessionstart.mjs`),
+            },
+          ],
+        },
+      ],
+      Stop: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "command",
+              command: buildHookRuntimeCommand(`${pluginRoot}/hooks/stop.mjs`),
             },
           ],
         },
@@ -315,7 +224,7 @@ export class ClaudeCodeAdapter implements HookAdapter {
       results.push({
         check: "PreToolUse hook",
         status: "fail",
-        message: "Could not read ~/.claude/settings.json",
+        message: `Could not read ${this.getSettingsPath()}`,
         fix: "context-mode upgrade",
       });
       return results;
@@ -350,6 +259,58 @@ export class ClaudeCodeAdapter implements HookAdapter {
     });
 
     return results;
+  }
+
+  /**
+   * Adapter-defined health checks (Algo-D1 + Algo-D5).
+   *
+   * For each entry in HOOK_SCRIPTS (the canonical hookType → scriptName
+   * map), emit a HealthCheck that joins `pluginRoot + "hooks" +
+   * scriptName` and probes via `existsSync`. Crucially, this NEVER
+   * parses a hook command — pluginRoot and scriptName are both in our
+   * hand, so the regex round-trip that produced the #548 doubled-path
+   * FAIL is bypassed entirely.
+   *
+   * The hook check derives from HOOK_SCRIPTS (single source of truth in
+   * src/adapters/claude-code/hooks.ts), so adding a new hook event in
+   * that map auto-extends doctor coverage — no parallel hardcoded list
+   * to maintain.
+   *
+   * Algo-D5: appends a single "Plugin cache integrity" check that
+   * delegates to the same helper start.mjs uses at boot
+   * (scripts/plugin-cache-integrity.mjs::assertPluginCacheIntegrity).
+   * Same code, two callsites — boot fail-fast and doctor diagnostic
+   * agree byte-for-byte. Users hitting #550 get the actionable signal
+   * without restarting the MCP server.
+   */
+  getHealthChecks(pluginRoot: string): readonly HealthCheck[] {
+    const hookChecks: HealthCheck[] = Object.entries(HOOK_SCRIPTS).map(
+      ([hookType, scriptName]) => {
+        const absolutePath = join(pluginRoot, "hooks", scriptName);
+        return {
+          name: `Hook script: ${hookType} (${scriptName})`,
+          check: () => {
+            // Direct existsSync — no hook-command parsing, no regex.
+            // pluginRoot is the value the doctor was invoked with;
+            // scriptName comes from the canonical HOOK_SCRIPTS map.
+            if (existsSync(absolutePath)) {
+              return { status: "OK" as const, detail: absolutePath };
+            }
+            return {
+              status: "FAIL" as const,
+              detail: `not found at ${absolutePath}`,
+            };
+          },
+        };
+      },
+    );
+
+    const integrityCheck: HealthCheck = {
+      name: "Plugin cache integrity",
+      check: () => checkPluginCacheIntegritySync(pluginRoot),
+    };
+
+    return [...hookChecks, integrityCheck];
   }
 
   /** Read plugin hooks from hooks/hooks.json or .claude-plugin/hooks/hooks.json */
@@ -440,9 +401,8 @@ export class ClaudeCodeAdapter implements HookAdapter {
   getInstalledVersion(): string {
     // Primary: read from installed_plugins.json
     try {
-      const ipPath = resolve(
-        homedir(),
-        ".claude",
+      const ipPath = join(
+        this.getConfigDir(),
         "plugins",
         "installed_plugins.json",
       );
@@ -459,11 +419,18 @@ export class ClaudeCodeAdapter implements HookAdapter {
       /* fallback below */
     }
 
-    // Fallback: scan common plugin cache locations
-    const bases = [
-      resolve(homedir(), ".claude"),
-      resolve(homedir(), ".config", "claude"),
-    ];
+    // Fallback: scan common plugin cache locations.
+    // `resolveClaudeConfigDir` honors $CLAUDE_CONFIG_DIR; the literal
+    // `~/.claude` is also retained as a hard floor so environments that
+    // misconfigure the env still find the canonical dir if it exists.
+    const bases = Array.from(
+      new Set([
+        this.getConfigDir(),
+        resolveClaudeConfigDir(),
+        resolve(homedir(), ".claude"),
+        resolve(homedir(), ".config", "claude"),
+      ]),
+    );
     for (const base of bases) {
       const cacheDir = resolve(
         base,
@@ -534,16 +501,55 @@ export class ClaudeCodeAdapter implements HookAdapter {
       }
     }
 
-    // If plugin hooks.json already covers all required hooks, skip settings.json
-    // registration entirely (Issue #198). Plugin installs don't need settings.json
-    // entries — hooks.json with ${CLAUDE_PLUGIN_ROOT} is the source of truth.
-    const pluginHooks = this.readPluginHooks(pluginRoot);
+    // If plugin hooks.json already covers all required hooks AND context-mode is
+    // actually installed as a Claude Code plugin (present in enabledPlugins), skip
+    // settings.json registration — hooks.json with ${CLAUDE_PLUGIN_ROOT} is the
+    // source of truth for plugin installs (Issue #198).
+    //
+    // Standalone / MacPorts installs are NOT in enabledPlugins. For those, the
+    // hooks/hooks.json shipped in the npm package is never consulted by Claude Code
+    // (it uses ${CLAUDE_PLUGIN_ROOT} which is only set in plugin mode). We must
+    // always write absolute-path hook commands to settings.json in that case.
+    const pluginRegistration = this.checkPluginRegistration();
+    const isPluginInstall = pluginRegistration.status === "pass";
+    const pluginHooks = isPluginInstall ? this.readPluginHooks(pluginRoot) : undefined;
     if (pluginHooks) {
       const allCovered = REQUIRED_HOOKS.every((ht) =>
         this.checkHookType(undefined, pluginHooks, ht),
       );
       if (allCovered) {
-        // Still write cleaned settings (stale removal) but don't add new entries
+        // Strip ONLY the inner context-mode hook commands from each matcher entry —
+        // hooks.json is the source of truth for ctx-mode. User hooks co-located in
+        // the same matcher entry MUST be preserved (#415: entry-level filter wiped
+        // every co-located user hook). After stripping, prune entries whose `hooks`
+        // array becomes empty.
+        const ctxScriptNames = Object.values(HOOK_SCRIPTS);
+        const isCtxModeCommand = (cmd?: string): boolean =>
+          cmd != null &&
+          (ctxScriptNames.some((s) => cmd.includes(s)) ||
+            cmd.includes("context-mode hook"));
+        for (const hookType of Object.keys(hooks)) {
+          const entries = hooks[hookType];
+          if (!Array.isArray(entries)) continue;
+          let totalRemoved = 0;
+          for (const entry of entries as Array<Record<string, unknown>>) {
+            const typedEntry = entry as { hooks?: Array<{ command?: string }> };
+            const innerHooks = typedEntry.hooks ?? [];
+            const before = innerHooks.length;
+            typedEntry.hooks = innerHooks.filter((h) => !isCtxModeCommand(h.command));
+            totalRemoved += before - typedEntry.hooks.length;
+          }
+          const pruned = (entries as Array<Record<string, unknown>>).filter((e) => {
+            const ih = (e as { hooks?: unknown[] }).hooks;
+            return Array.isArray(ih) && ih.length > 0;
+          });
+          if (totalRemoved > 0 || pruned.length !== entries.length) {
+            hooks[hookType] = pruned;
+            if (totalRemoved > 0) {
+              changes.push(`Removed ${totalRemoved} duplicate ${hookType} hook(s) — covered by plugin hooks.json`);
+            }
+          }
+        }
         settings.hooks = hooks;
         this.writeSettings(settings);
         changes.push("Skipped settings.json registration — plugin hooks.json is sufficient");
@@ -612,18 +618,6 @@ export class ClaudeCodeAdapter implements HookAdapter {
     return changes;
   }
 
-  backupSettings(): string | null {
-    const settingsPath = this.getSettingsPath();
-    try {
-      accessSync(settingsPath, constants.R_OK);
-      const backupPath = settingsPath + ".bak";
-      copyFileSync(settingsPath, backupPath);
-      return backupPath;
-    } catch {
-      return null;
-    }
-  }
-
   setHookPermissions(pluginRoot: string): string[] {
     const set: string[] = [];
     for (const [, scriptName] of Object.entries(HOOK_SCRIPTS)) {
@@ -641,9 +635,8 @@ export class ClaudeCodeAdapter implements HookAdapter {
 
   updatePluginRegistry(pluginRoot: string, version: string): void {
     try {
-      const ipPath = resolve(
-        homedir(),
-        ".claude",
+      const ipPath = join(
+        this.getConfigDir(),
         "plugins",
         "installed_plugins.json",
       );
@@ -662,13 +655,10 @@ export class ClaudeCodeAdapter implements HookAdapter {
     }
   }
 
-  // ── Internal helpers ───────────────────────────────────
+  // ── Session ID extraction ───────────────────────────────
+  // Claude Code priority: transcript_path UUID > session_id > CLAUDE_SESSION_ID > ppid
 
-  /**
-   * Extract session ID from Claude Code hook input.
-   * Priority: transcript_path UUID > session_id field > CLAUDE_SESSION_ID env > ppid fallback.
-   */
-  private extractSessionId(input: ClaudeCodeHookInput): string {
+  protected extractSessionId(input: ClaudeCodeWireInput): string {
     if (input.transcript_path) {
       const match = input.transcript_path.match(
         /([a-f0-9-]{36})\.jsonl$/,

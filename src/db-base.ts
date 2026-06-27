@@ -9,9 +9,15 @@
 import type DatabaseConstructor from "better-sqlite3";
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { createRequire } from "node:module";
-import { unlinkSync } from "node:fs";
+import { existsSync, unlinkSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+// v1.0.130 — `acquireDbLock` + `locking_mode = EXCLUSIVE` were REMOVED.
+// See docs/adr/0001-sessiondb-multi-writer.md for the architectural
+// rationale. The short version: SessionDB is multi-writer-safe and the
+// process-identity invariants the lockfile tried to enforce belong in
+// the process layer (sibling-mcp), not the DB layer. WAL + busy_timeout
+// + withRetry handle the actual concurrency safely.
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -104,15 +110,144 @@ export class BunSQLiteAdapter {
 }
 
 // ─────────────────────────────────────────────────────────
+// node:sqlite adapter (#228)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Wraps node:sqlite's DatabaseSync to provide better-sqlite3-compatible API.
+ * Bridges: .pragma(), .transaction(). Everything else is passthrough.
+ * Eliminates native addon SIGSEGV on Linux (nodejs/node#62515).
+ */
+export class NodeSQLiteAdapter {
+  #raw: any; // DatabaseSync instance
+
+  constructor(rawDb: any) {
+    this.#raw = rawDb;
+  }
+
+  pragma(source: string): any {
+    // "journal_mode = WAL" → PRAGMA journal_mode = WAL
+    // "table_xinfo(session_events)" → PRAGMA table_xinfo(session_events)
+    // "wal_checkpoint(TRUNCATE)" → PRAGMA wal_checkpoint(TRUNCATE)
+    const stmt = this.#raw.prepare(`PRAGMA ${source}`);
+    const rows = stmt.all();
+    if (!rows || rows.length === 0) return undefined;
+    if (rows.length > 1) return rows;
+    const values = Object.values(rows[0] as Record<string, unknown>);
+    return values.length === 1 ? values[0] : rows[0];
+  }
+
+  exec(sql: string): any {
+    // node:sqlite's exec() supports multi-statement natively
+    this.#raw.exec(sql);
+    return this;
+  }
+
+  prepare(sql: string): any {
+    const stmt = this.#raw.prepare(sql);
+    return {
+      run: (...args: unknown[]) => stmt.run(...args),
+      get: (...args: unknown[]) => stmt.get(...args),
+      all: (...args: unknown[]) => stmt.all(...args),
+      iterate: (...args: unknown[]) => {
+        // node:sqlite uses Symbol.iterator on StatementSync, not .iterate()
+        // Check if iterate exists, otherwise use Symbol.iterator
+        if (typeof stmt.iterate === 'function') {
+          return stmt.iterate(...args);
+        }
+        // Fallback: use all() to create an iterator
+        const rows = stmt.all(...args);
+        return rows[Symbol.iterator]();
+      },
+    };
+  }
+
+  transaction(fn: (...args: any[]) => any): any {
+    // node:sqlite has no transaction() method — manual BEGIN/COMMIT/ROLLBACK
+    return (...args: any[]) => {
+      this.#raw.exec("BEGIN");
+      try {
+        const result = fn(...args);
+        this.#raw.exec("COMMIT");
+        return result;
+      } catch (err) {
+        this.#raw.exec("ROLLBACK");
+        throw err;
+      }
+    };
+  }
+
+  close(): void {
+    this.#raw.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────
 // Lazy loader
 // ─────────────────────────────────────────────────────────
 
 let _Database: typeof DatabaseConstructor | null = null;
 
 /**
+ * Probe whether the supplied node:sqlite DatabaseSync constructor links a
+ * SQLite build that includes the FTS5 module. Some Node.js Linux builds
+ * (e.g. v22.14.0 on Ubuntu) ship node:sqlite without FTS5 even though the
+ * import succeeds, which silently breaks ctx_search/ctx_batch_execute and
+ * the doctor's FTS5 check (issue #461).
+ *
+ * Returns true only when a `CREATE VIRTUAL TABLE … USING fts5(x)` statement
+ * succeeds. Always returns false on any failure (constructor throw, missing
+ * module, etc.) so the caller can fall through to better-sqlite3, whose
+ * bundled SQLite always ships with FTS5.
+ */
+export function nodeSqliteHasFts5(DatabaseSync: any): boolean {
+  let probe: any = null;
+  try {
+    probe = new DatabaseSync(":memory:");
+    probe.exec("CREATE VIRTUAL TABLE __fts5_probe USING fts5(x)");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { probe?.close(); } catch { /* probe never opened or already closed */ }
+  }
+}
+
+/**
+ * Returns true when the current runtime ships a built-in SQLite binding:
+ * - Bun has `bun:sqlite` always
+ * - Node has `node:sqlite` since 22.5 (no flag since 22.13)
+ *
+ * Mirrors the helper in hooks/ensure-deps.mjs:61. Exported so the platform
+ * gate in loadDatabase() can be unit-tested without spawning a child
+ * process. `versionsOverride` and `bunOverride` are injection points for
+ * tests — production callers pass nothing.
+ *
+ * Widening the gate from `process.platform === "linux"` to this helper is
+ * required for Node 26 on macOS arm64 (#551): Node 26 removed
+ * `info.This()` from V8 PropertyCallbackInfo, breaking better-sqlite3
+ * 12.9.0's native compile. Using node:sqlite sidesteps the native addon
+ * entirely on every platform that has it.
+ */
+export function hasModernSqlite(
+  versionsOverride?: NodeJS.ProcessVersions,
+  bunOverride?: unknown,
+): boolean {
+  const bun = bunOverride !== undefined ? bunOverride : (globalThis as any).Bun;
+  if (typeof bun !== "undefined" && bun !== null) return true;
+  const versions = versionsOverride ?? process.versions;
+  const [majorStr, minorStr] = (versions.node ?? "0.0.0").split(".");
+  const major = Number(majorStr);
+  const minor = Number(minorStr);
+  if (!Number.isFinite(major) || !Number.isFinite(minor)) return false;
+  return major > 22 || (major === 22 && minor >= 5);
+}
+
+/**
  * Lazy-load the SQLite driver for the current runtime.
  * Bun → bun:sqlite via BunSQLiteAdapter (issue #45).
- * Node → better-sqlite3 (native addon).
+ * Modern Node (>= 22.5) → node:sqlite via NodeSQLiteAdapter when it ships FTS5 (#228, #461, #551).
+ * Other Node (or modern Node without FTS5) → better-sqlite3 (native addon).
  */
 export function loadDatabase(): typeof DatabaseConstructor {
   if (!_Database) {
@@ -127,10 +262,63 @@ export function loadDatabase(): typeof DatabaseConstructor {
           readonly: opts?.readonly,
           create: true,
         });
-        return new BunSQLiteAdapter(raw);
+        const adapter = new BunSQLiteAdapter(raw);
+        // Propagate busy_timeout — better-sqlite3 does this via constructor
+        // option but bun:sqlite does not, so we set it via pragma (#243)
+        if (opts?.timeout) {
+          adapter.pragma(`busy_timeout = ${opts.timeout}`);
+        }
+        return adapter;
       } as any;
+    } else if (hasModernSqlite()) {
+      // Any Node >= 22.5 — try node:sqlite to avoid the native addon path
+      // entirely. Historically this was Linux-only (avoiding the Linux
+      // SIGSEGV per nodejs/node#62515, #228), but Node 26 also broke
+      // better-sqlite3's native compile on macOS arm64 by removing
+      // V8 `info.This()` (#551). The built-in `node:sqlite` ships its
+      // own SQLite, so it sidesteps both issues at once.
+      //
+      // Probe FTS5 support before committing — some Node builds ship
+      // node:sqlite without FTS5, which would silently break ctx_search
+      // (#461). The probe runs at most once per process (cached via
+      // _Database below), so the cost of an in-memory DatabaseSync is
+      // negligible.
+      let DatabaseSync: any = null;
+      try {
+        // Array.join() prevents esbuild from resolving the specifier at bundle time
+        // (mirrors the bun:sqlite branch above).
+        ({ DatabaseSync } = require(["node", "sqlite"].join(":")));
+      } catch {
+        DatabaseSync = null;
+      }
+      if (DatabaseSync && nodeSqliteHasFts5(DatabaseSync)) {
+        _Database = function NodeDatabaseFactory(path: string, opts?: any) {
+          const raw = new DatabaseSync(path, {
+            readOnly: opts?.readonly ?? false,
+          });
+          const adapter = new NodeSQLiteAdapter(raw);
+          // Propagate busy_timeout — node:sqlite's DatabaseSync constructor
+          // silently ignores `{ timeout }` (unlike better-sqlite3's native
+          // C++ constructor), so we set it via PRAGMA, mirroring the Bun
+          // branch above. Without this, the default is 0 and the first
+          // write contention surfaces as immediate `SQLITE_BUSY`/`database
+          // is locked` — defeating the 30s grace `withRetry()` is built
+          // around. See issue #642 and ADR-0001 (multi-writer contract).
+          if (opts?.timeout) {
+            adapter.pragma(`busy_timeout = ${opts.timeout}`);
+          }
+          return adapter;
+        } as any;
+      } else {
+        // node:sqlite missing or built without FTS5 — fall through to
+        // better-sqlite3. Trade-off: on Node 26 + macOS this may now hit
+        // the V8 ABI break (#551). A visible crash on the rare
+        // unstable build is preferable to silent "no such module: fts5"
+        // on every ctx_search call.
+        _Database = require("better-sqlite3") as typeof DatabaseConstructor;
+      }
     } else {
-      // Node.js — use better-sqlite3.
+      // Old Node (< 22.5) without bun:sqlite — fall back to better-sqlite3.
       _Database = require("better-sqlite3") as typeof DatabaseConstructor;
     }
   }
@@ -154,11 +342,37 @@ export function loadDatabase(): typeof DatabaseConstructor {
 export function applyWALPragmas(db: DatabaseInstance): void {
   db.pragma("journal_mode = WAL");
   db.pragma("synchronous = NORMAL");
+  // Memory-map the DB file for read-heavy FTS5 search workloads.
+  // Eliminates read() syscalls — the kernel serves pages directly from
+  // the page cache. 256MB is a safe upper bound (SQLite only maps up to
+  // the actual file size). Falls back gracefully on platforms where mmap
+  // is unavailable or restricted.
+  try { db.pragma("mmap_size = 268435456"); } catch { /* unsupported runtime */ }
+  // NOTE: `locking_mode = EXCLUSIVE` is intentionally NOT applied here.
+  // ALL DBs built on this helper — ContentStore (FTS5 shared knowledge
+  // base) AND SessionDB (per-project events) — are multi-writer-safe by
+  // contract. WAL + busy_timeout + the withRetry() wrapper below handle
+  // SQLITE_BUSY natively. EXCLUSIVE locking is opt-out, never opt-in
+  // from a base class shared by multi-writer consumers.
+  // See docs/adr/0001-sessiondb-multi-writer.md for the v1.0.130 ADR.
 }
 
 // ─────────────────────────────────────────────────────────
 // DB file helpers
 // ─────────────────────────────────────────────────────────
+
+/**
+ * Remove orphaned WAL/SHM files when the main DB file doesn't exist.
+ * On Windows, stale -wal/-shm files from crashed processes cause
+ * "file is not a database" errors when creating a fresh DB.
+ */
+export function cleanOrphanedWALFiles(dbPath: string): void {
+  if (!existsSync(dbPath)) {
+    for (const suffix of ["-wal", "-shm"]) {
+      try { unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+    }
+  }
+}
 
 /**
  * Delete all three SQLite files for a given db path (main, WAL, SHM).
@@ -240,6 +454,36 @@ export function withRetry<T>(fn: () => T, delays: number[] = [100, 500, 2000]): 
 }
 
 // ─────────────────────────────────────────────────────────
+// Corrupt DB recovery (#244)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Detect SQLite corruption errors that warrant a rename-and-recreate.
+ * Matches SQLITE_CORRUPT, SQLITE_NOTADB, and their human-readable equivalents.
+ */
+export function isSQLiteCorruptionError(msg: string): boolean {
+  return (
+    msg.includes("SQLITE_CORRUPT") ||
+    msg.includes("SQLITE_NOTADB") ||
+    msg.includes("database disk image is malformed") ||
+    msg.includes("file is not a database")
+  );
+}
+
+/**
+ * Rename a corrupt DB and its WAL/SHM files so a fresh DB can be created.
+ * Best-effort — individual rename failures are silently ignored.
+ */
+export function renameCorruptDB(dbPath: string): void {
+  const ts = Date.now();
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      renameSync(dbPath + suffix, `${dbPath}${suffix}.corrupt-${ts}`);
+    } catch { /* file may not exist */ }
+  }
+}
+
+// ─────────────────────────────────────────────────────────
 // Base class
 // ─────────────────────────────────────────────────────────
 
@@ -260,14 +504,19 @@ export function withRetry<T>(fn: () => T, delays: number[] = [100, 500, 2000]): 
  * re-imports within the same fork process (ESM isolate mode clears
  * module-level state but globalThis persists).
  */
-const _kLiveDBs = Symbol.for("__context_mode_live_dbs__");
+// v1.0.130 — symbol name bumped because the value type reverted from
+// Map<DatabaseInstance, string> (v1.0.128 lockfile pairing) back to
+// Set<DatabaseInstance>. A persistent global slot from a v1.0.128 or
+// v1.0.129 module would deserialize as the wrong shape and crash the
+// exit hook iteration.
+const _kLiveDBs = Symbol.for("__context_mode_live_dbs_v3__");
 const _liveDBs: Set<DatabaseInstance> = (() => {
   const g = globalThis as Record<symbol, Set<DatabaseInstance> | undefined>;
   if (!g[_kLiveDBs]) {
     g[_kLiveDBs] = new Set<DatabaseInstance>();
     process.on("exit", () => {
       for (const db of g[_kLiveDBs]!) {
-        try { db.close(); } catch { /* already closed */ }
+        closeDB(db);
       }
       g[_kLiveDBs]!.clear();
     });
@@ -279,12 +528,53 @@ export abstract class SQLiteBase {
   readonly #dbPath: string;
   readonly #db: DatabaseInstance;
 
+  /**
+   * Open (or create) a SQLite DB at `dbPath`.
+   *
+   * v1.0.130 — multi-writer is the contract. ALL SQLiteBase consumers
+   * (SessionDB, ContentStore) may open the same on-disk dbPath from
+   * multiple processes simultaneously — that is the legitimate multi-
+   * window UX shape and the WAL handles it natively. SQLITE_BUSY on
+   * write contention is absorbed by `withRetry()` below (busy_timeout
+   * = 30000ms inside `new Database(...)`).
+   *
+   * v1.0.128 introduced a single-writer guard here as a defense against
+   * #560. That defense was an over-correction — the actual root causes
+   * of #560 were #559 (zombie MCP child accumulation) and #561 (Pi
+   * misdetection writing to the wrong DB path), both fixed in v1.0.128
+   * + v1.0.129. The single-writer guard broke legitimate multi-window
+   * users; v1.0.130 rolls it out. See
+   * docs/adr/0001-sessiondb-multi-writer.md and the v1.0.130 INVARIANT
+   * block in tests/util/db-base-platform-gate.test.ts for the
+   * regression-proof anchor (source-pin + behavioural).
+   */
   constructor(dbPath: string) {
     const Database = loadDatabase();
     this.#dbPath = dbPath;
-    this.#db = new Database(dbPath, { timeout: 30000 });
+    cleanOrphanedWALFiles(dbPath);
+    let db: DatabaseInstance;
+    try {
+      db = new Database(dbPath, { timeout: 30000 });
+      applyWALPragmas(db);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isSQLiteCorruptionError(msg)) {
+        renameCorruptDB(dbPath);
+        cleanOrphanedWALFiles(dbPath);
+        try {
+          db = new Database(dbPath, { timeout: 30000 });
+          applyWALPragmas(db);
+        } catch (retryErr) {
+          throw new Error(
+            `Failed to create fresh DB after renaming corrupt file: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
+          );
+        }
+      } else {
+        throw err;
+      }
+    }
+    this.#db = db;
     _liveDBs.add(this.#db);
-    applyWALPragmas(this.#db);
     this.initSchema();
     this.prepareStatements();
   }

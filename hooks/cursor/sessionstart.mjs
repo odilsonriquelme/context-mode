@@ -14,10 +14,10 @@ import {
   writeSessionEventsFile,
   buildSessionDirective,
   getSessionEvents,
-  getLatestSessionEvents,
 } from "../session-directive.mjs";
 import {
   readStdin,
+  parseStdin,
   getSessionId,
   getSessionDBPath,
   getSessionEventsPath,
@@ -25,19 +25,19 @@ import {
   getInputProjectDir,
   CURSOR_OPTS,
 } from "../session-helpers.mjs";
-import { join } from "node:path";
 import { unlinkSync } from "node:fs";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { createSessionLoaders } from "../session-loaders.mjs";
 
 const HOOK_DIR = fileURLToPath(new URL(".", import.meta.url));
-const PKG_SESSION = join(HOOK_DIR, "..", "..", "build", "session");
+const { loadSessionDB } = createSessionLoaders(HOOK_DIR);
 const OPTS = CURSOR_OPTS;
 
 let additionalContext = ROUTING_BLOCK;
 
 try {
   const raw = await readStdin();
-  const input = JSON.parse(raw);
+  const input = parseStdin(raw);
   const source = input.source ?? input.trigger ?? "startup";
   const projectDir = getInputProjectDir(input, CURSOR_OPTS);
 
@@ -46,8 +46,8 @@ try {
   }
 
   if (source === "compact" || source === "resume") {
-    const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
-    const dbPath = getSessionDBPath(OPTS);
+    const { SessionDB } = await loadSessionDB();
+    const dbPath = getSessionDBPath(OPTS, projectDir);
     const db = new SessionDB({ dbPath });
 
     if (source === "compact") {
@@ -57,23 +57,27 @@ try {
         db.markResumeConsumed(sessionId);
       }
     } else {
-      try { unlinkSync(getCleanupFlagPath(OPTS)); } catch { /* no flag */ }
+      try { unlinkSync(getCleanupFlagPath(OPTS, projectDir)); } catch { /* no flag */ }
     }
 
-    const events = source === "compact"
-      ? getSessionEvents(db, getSessionId(input, OPTS))
-      : getLatestSessionEvents(db);
+    // Filter events to the session being resumed/compacted. Falling back to
+    // getLatestSessionEvents(db) for resume leaks events from any other
+    // session whose session_meta.started_at is more recent — observed
+    // cross-session bleed when a different session started after this one
+    // and before the resume.
+    const sessionId = getSessionId(input, OPTS);
+    const events = sessionId ? getSessionEvents(db, sessionId) : [];
     if (events.length > 0) {
-      const eventMeta = writeSessionEventsFile(events, getSessionEventsPath(OPTS));
+      const eventMeta = writeSessionEventsFile(events, getSessionEventsPath(OPTS, projectDir));
       additionalContext += buildSessionDirective(source, eventMeta, toolNamer);
     }
 
     db.close();
   } else if (source === "startup") {
-    const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
-    const dbPath = getSessionDBPath(OPTS);
+    const { SessionDB } = await loadSessionDB();
+    const dbPath = getSessionDBPath(OPTS, projectDir);
     const db = new SessionDB({ dbPath });
-    try { unlinkSync(getSessionEventsPath(OPTS)); } catch { /* no stale file */ }
+    try { unlinkSync(getSessionEventsPath(OPTS, projectDir)); } catch { /* no stale file */ }
 
     db.cleanupOldSessions(7);
     db.db.exec(`DELETE FROM session_events WHERE session_id NOT IN (SELECT session_id FROM session_meta)`);

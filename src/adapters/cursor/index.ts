@@ -5,20 +5,22 @@
  * `.cursor/hooks.json` / `~/.cursor/hooks.json`.
  */
 
-import { createHash } from "node:crypto";
 import {
   readFileSync,
   writeFileSync,
   mkdirSync,
-  copyFileSync,
   accessSync,
   chmodSync,
   constants,
   existsSync,
+  readdirSync,
 } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
+
+import { BaseAdapter } from "../base.js";
+import { resolveClaudeConfigDir } from "../../util/claude-config.js";
 
 import type {
   HookAdapter,
@@ -74,7 +76,11 @@ interface CursorHooksFile {
 
 const CURSOR_ENTERPRISE_HOOKS_PATH = "/Library/Application Support/Cursor/hooks.json";
 
-export class CursorAdapter implements HookAdapter {
+export class CursorAdapter extends BaseAdapter implements HookAdapter {
+  constructor() {
+    super([".cursor"]);
+  }
+
   readonly name = "Cursor";
   readonly paradigm: HookParadigm = "json-stdio";
 
@@ -82,7 +88,10 @@ export class CursorAdapter implements HookAdapter {
     preToolUse: true,
     postToolUse: true,
     preCompact: false,
-    sessionStart: false,
+    // Cursor v1 ships native sessionStart and the matching hook script
+    // (hooks/cursor/sessionstart.mjs) is wired through the dispatcher
+    // (src/cli.ts HOOK_MAP). Capability flag must reflect script presence.
+    sessionStart: true,
     canModifyArgs: true,
     canModifyOutput: false,
     canInjectSessionContext: true,
@@ -209,26 +218,17 @@ export class CursorAdapter implements HookAdapter {
     return resolve(".cursor", "hooks.json");
   }
 
-  getSessionDir(): string {
-    const dir = join(homedir(), ".cursor", "context-mode", "sessions");
-    mkdirSync(dir, { recursive: true });
-    return dir;
+  /**
+   * Cursor stores conventions per project under .cursor/. Always returned
+   * as an absolute path resolved against `projectDir` (or `process.cwd()`
+   * when omitted) per the HookAdapter.getConfigDir contract.
+   */
+  getConfigDir(projectDir?: string): string {
+    return resolve(projectDir ?? process.cwd(), ".cursor");
   }
 
-  getSessionDBPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}.db`);
-  }
-
-  getSessionEventsPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}-events.md`);
+  getInstructionFiles(): string[] {
+    return ["context-mode.mdc"];
   }
 
   generateHookConfig(_pluginRoot: string): HookRegistration {
@@ -363,7 +363,76 @@ export class CursorAdapter implements HookAdapter {
       });
     }
 
+    const pluginInstalls = this.detectPluginInstalls();
+    if (pluginInstalls.length > 0) {
+      const nativeHasContextMode = loaded
+        ? Object.entries(loaded.config.hooks ?? {}).some(([type, entries]) =>
+            Array.isArray(entries) && (entries as CursorHookCommandEntry[]).some(
+              (entry) => isContextModeHook(entry, type as HookType),
+            ),
+          )
+        : false;
+      if (nativeHasContextMode && loaded) {
+        results.push({
+          check: "Plugin/native hook duplication",
+          status: "warn",
+          message:
+            `context-mode plugin detected at ${pluginInstalls[0]} alongside native hooks in ${loaded.path} — ` +
+            `each event will fire twice. Remove one configuration to avoid duplicate routing.`,
+          fix: "Remove the native .cursor/hooks.json entries OR uninstall the plugin",
+        });
+      } else {
+        results.push({
+          check: "Plugin install",
+          status: "pass",
+          message: `context-mode plugin installed at ${pluginInstalls[0]}`,
+        });
+      }
+    }
+
     return results;
+  }
+
+  /**
+   * Detects context-mode plugin installations under Cursor's plugin directories.
+   * Returns absolute paths to any `.cursor-plugin/plugin.json` files whose
+   * `name` matches `context-mode`.
+   */
+  private detectPluginInstalls(): string[] {
+    const roots = [
+      join(homedir(), ".cursor", "plugins", "local"),
+      join(homedir(), ".cursor", "plugins", "cache"),
+    ];
+    const found: string[] = [];
+
+    for (const root of roots) {
+      try {
+        accessSync(root, constants.F_OK);
+      } catch {
+        continue;
+      }
+      // Plugins live one directory deep: <root>/<name>/.cursor-plugin/plugin.json
+      let entries: string[] = [];
+      try {
+        entries = readdirSync(root);
+      } catch {
+        continue;
+      }
+      for (const name of entries) {
+        const manifestPath = join(root, name, ".cursor-plugin", "plugin.json");
+        try {
+          const raw = readFileSync(manifestPath, "utf-8");
+          const parsed = JSON.parse(raw) as { name?: string };
+          if (parsed?.name === "context-mode") {
+            found.push(manifestPath);
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+
+    return found;
   }
 
   checkPluginRegistration(): DiagnosticResult {
@@ -393,6 +462,20 @@ export class CursorAdapter implements HookAdapter {
       } catch {
         continue;
       }
+    }
+
+    // #489 round-3 — pure plugin install (Marketplace) bundles MCP registration
+    // inside the plugin package. No native mcp.json exists, but the plugin
+    // manifest under ~/.cursor/plugins/{local,cache}/<name>/.cursor-plugin/plugin.json
+    // is enough to consider context-mode registered. Without this, doctor
+    // self-contradicts: `Plugin install: pass` alongside `MCP registration: warn`.
+    const pluginInstalls = this.detectPluginInstalls();
+    if (pluginInstalls.length > 0) {
+      return {
+        check: "MCP registration",
+        status: "pass",
+        message: `context-mode registered via plugin manifest at ${pluginInstalls[0]}`,
+      };
     }
 
     return {
@@ -462,17 +545,7 @@ export class CursorAdapter implements HookAdapter {
     return changes;
   }
 
-  backupSettings(): string | null {
-    const settingsPath = this.getSettingsPath();
-    try {
-      accessSync(settingsPath, constants.R_OK);
-      const backupPath = settingsPath + ".bak";
-      copyFileSync(settingsPath, backupPath);
-      return backupPath;
-    } catch {
-      return null;
-    }
-  }
+
 
   setHookPermissions(pluginRoot: string): string[] {
     const set: string[] = [];
@@ -533,10 +606,13 @@ export class CursorAdapter implements HookAdapter {
   }
 
   private hasClaudeCompatibilityHooks(): boolean {
+    // Issue #460 round-3: probe the resolved CC config dir (honors
+    // $CLAUDE_CONFIG_DIR) instead of the literal ~/.claude so users
+    // who relocated their CC config still trigger the compat path.
     const compatPaths = [
       resolve(".claude", "settings.json"),
       resolve(".claude", "settings.local.json"),
-      join(homedir(), ".claude", "settings.json"),
+      join(resolveClaudeConfigDir(), "settings.json"),
     ];
 
     return compatPaths.some((configPath) => existsSync(configPath));
